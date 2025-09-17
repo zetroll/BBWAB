@@ -1,24 +1,7 @@
 /**
- * server.js - Interactive two-button flow (TV / AC) for Whapi.Cloud
+ * server.js - Interactive buttons (fixed): sanitize 'to', correct interactive payload, ignore statuses/from_me
  *
- * Flow:
- * 1) On inbound message, send INTRO_TEXT as text ACK.
- * 2) Send an interactive message with two quick-reply buttons (TV, AC).
- * 3) When user chooses button (or replies with text), send corresponding LINK and PDF.
- *
- * Env vars (Railway):
- * - SEND_API_KEY (required)
- * - SEND_TEXT_URL (default https://gate.whapi.cloud/messages/text)
- * - SEND_DOC_URL  (default https://gate.whapi.cloud/messages/document)
- * - SEND_INTERACTIVE_URL (default https://gate.whapi.cloud/messages/interactive)
- * - INTRO_TEXT (required) - text to show before buttons
- * - TV_BUTTON_TITLE (default TV)
- * - TV_LINK (required) - url
- * - TV_MEDIA_ID (required)
- * - AC_BUTTON_TITLE (default AC)
- * - AC_LINK (required)
- * - AC_MEDIA_ID (required)
- * - VERIFY_TOKEN (optional)
+ * Replace your current server.js with this file and redeploy.
  */
 
 const express = require("express");
@@ -46,6 +29,7 @@ const AC_LINK = process.env.AC_LINK || "";
 const AC_MEDIA_ID = process.env.AC_MEDIA_ID || "";
 
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || null;
+const SENDER_PHONE = process.env.SENDER_PHONE || null; // optional: your own number to ignore echoes
 const PDF_FILENAME = process.env.PDF_FILENAME || "document.pdf";
 
 const DEDUPE_TTL_MIN = parseInt(process.env.DEDUPE_TTL_MIN || "5", 10);
@@ -70,47 +54,70 @@ const dedupe = new LRU({ max: MAX_DEDUPE_ENTRIES, ttl: DEDUPE_TTL_MS });
 
 app.get("/health", (req, res) => res.json({ status: "ok" }));
 
-/* helpers */
-function extractCommon(body) {
-  // return { messageId, from, text, raw }
-  if (!body) return { messageId: null, from: null, text: null, raw: body };
+/* Normalize phone/JID to acceptable 'to' form:
+   - If includes '@', keep domain but strip non-digits from user part.
+   - Else, strip non-digits.
+   Returns string or null if invalid.
+*/
+function normalizePhone(raw) {
+  if (!raw || typeof raw !== "string") return null;
+  raw = raw.trim();
+  if (raw.includes("@")) {
+    const parts = raw.split("@");
+    let user = parts[0].replace(/\D+/g, ""); // keep digits only
+    const domain = parts.slice(1).join("@");
+    if (!user) return null;
+    return `${user}@${domain}`;
+  } else {
+    // remove any non-digit characters (spaces, plus, parens, dashes)
+    const digits = raw.replace(/\D+/g, "");
+    return digits.length >= 9 ? digits : null;
+  }
+}
 
-  // Whapi sometimes wraps messages in `messages` array (observed)
+/* Extract common incoming shapes and also detect statuses vs messages */
+function extractCommon(body) {
+  if (!body) return { kind: "unknown", raw: body };
+
+  // statuses (delivery/read) - ignore
+  if (Array.isArray(body.statuses) && body.statuses.length > 0) {
+    return { kind: "status", statuses: body.statuses, raw: body };
+  }
+
+  // messages array (common Whapi shape)
   if (Array.isArray(body.messages) && body.messages.length > 0) {
     const m = body.messages[0];
-    const text = m?.text?.body || m?.message?.text?.body || m?.body || null;
     return {
+      kind: "message",
       messageId: m.id || m.msg_id || m.message_id || null,
-      from: (m.from || m.sender || m.chat_id || m?.from_name || null),
-      text,
+      from: m.from || m.sender || m.chat_id || null,
+      from_me: !!m.from_me,
+      text: m?.text?.body || m?.body || m?.message?.text?.body || null,
       raw: m
     };
   }
 
-  // WhatsApp Cloud style wrapper (some providers)
-  if (body?.whatsappInboundMessage) {
-    const w = body.whatsappInboundMessage;
-    const text = w?.text?.body || w?.message?.text?.body || null;
+  // some providers use top-level 'messages' differently, check for direct 'message' wrapper
+  if (body.message) {
+    const m = body.message;
     return {
-      messageId: w?.id || null,
-      from: w?.from || null,
-      text,
-      raw: w
+      kind: "message",
+      messageId: m.id || null,
+      from: m.from || m.sender || null,
+      from_me: !!m.from_me,
+      text: m?.text?.body || m?.body || null,
+      raw: m
     };
   }
 
-  // fallback: top-level fields
-  return {
-    messageId: body.id || body.message_id || Date.now().toString(),
-    from: body.from || body.sender || body.phone || null,
-    text: body?.text?.body || body?.body || null,
-    raw: body
-  };
+  // fallback: unknown
+  return { kind: "unknown", raw: body };
 }
 
-async function sendText(toPhone, body) {
+/* Send helpers using Whapi documented shapes */
+async function sendText(toPhone, bodyText) {
   const headers = { Authorization: `Bearer ${SEND_API_KEY}`, "Content-Type": "application/json" };
-  const payload = { to: String(toPhone), body: String(body) };
+  const payload = { to: String(toPhone), body: String(bodyText) };
   return axios.post(SEND_TEXT_URL, payload, { headers, timeout: SEND_TIMEOUT_MS });
 }
 
@@ -123,51 +130,58 @@ async function sendDocument(toPhone, mediaId) {
 async function sendInteractiveButtons(toPhone) {
   const headers = { Authorization: `Bearer ${SEND_API_KEY}`, "Content-Type": "application/json" };
 
-  // Per Whapi/WhatsApp interactive/button schema: type 'interactive', action.buttons -> reply buttons
+  // Per Whapi docs: top-level body, top-level action, type, to
   const payload = {
-    to: String(toPhone),
-    type: "interactive",
-    interactive: {
-      type: "button",
-      body: { text: INTRO_TEXT },
-      action: {
-        buttons: [
-          { type: "reply", reply: { id: "tv", title: TV_BUTTON_TITLE } },
-          { type: "reply", reply: { id: "ac", title: AC_BUTTON_TITLE } }
-        ]
-      }
-    }
+    body: { text: INTRO_TEXT },
+    action: {
+      buttons: [
+        { type: "quick_reply", title: TV_BUTTON_TITLE, id: "tv" },
+        { type: "quick_reply", title: AC_BUTTON_TITLE, id: "ac" }
+      ]
+    },
+    type: "button",
+    to: String(toPhone)
   };
 
   return axios.post(SEND_INTERACTIVE_URL, payload, { headers, timeout: SEND_TIMEOUT_MS });
 }
 
-/* detect interactive button reply in many possible webhook shapes */
+/* Extract button reply from webhook shapes (support various callbacks) */
 function extractButtonReply(body) {
-  // common patterns:
-  // - body.interactive.button_reply.id
-  // - body.messages[0].interactive.button_reply.id
-  // - body.whatsappInboundMessage.interactive.button_reply.id
-  const raw = body || {};
-  const candidates = [
-    raw.interactive?.button_reply,
-    raw.messages?.[0]?.interactive?.button_reply,
-    raw.whatsappInboundMessage?.interactive?.button_reply,
-    raw.whatsappInboundMessage?.interactive?.button_reply,
-    raw.interactive?.button_reply
-  ];
-  for (const c of candidates) {
-    if (c && (c.id || c.title)) return { id: c.id || null, title: c.title || null };
+  if (!body) return null;
+
+  // Known shape: messages[0].reply.buttons_reply (support older "buttons_reply") or reply/buttons_reply
+  try {
+    const m = (body.messages && body.messages[0]) || body.message || body;
+    // support Whapi helpdesk examples: reply.buttons_reply.id or reply.type === 'buttons_reply'
+    if (m?.reply?.buttons_reply) {
+      return { id: m.reply.buttons_reply.id, title: m.reply.buttons_reply.title };
+    }
+    // old example: reply.type == 'buttons_reply' && reply.buttons_reply.{id,title}
+    if (m?.reply?.type === "buttons_reply" && m?.reply?.buttons_reply) {
+      return { id: m.reply.buttons_reply.id, title: m.reply.buttons_reply.title };
+    }
+    // another example from docs: messages[0].reply.type === 'buttons_reply' and reply.buttons_reply present
+    if (m?.reply?.type === "buttons_reply" && m?.reply?.buttons_reply) {
+      return { id: m.reply.buttons_reply.id, title: m.reply.buttons_reply.title };
+    }
+
+    // WhatsApp Cloud-like: messages[0].interactive.button_reply
+    if (m?.interactive?.button_reply) {
+      return { id: m.interactive.button_reply.id, title: m.interactive.button_reply.title };
+    }
+
+    // fallback: messages[0].reply?.buttons_reply
+    const br = m?.reply?.buttons_reply || m?.reply?.buttons_reply;
+    if (br && (br.id || br.title)) return { id: br.id || null, title: br.title || null };
+
+  } catch (e) {
+    // ignore
   }
-
-  // some providers put reply under 'reply' or 'message.reply'
-  const alt = raw.messages?.[0]?.reply || raw.reply || raw.messages?.[0]?.message?.reply;
-  if (alt && (alt.id || alt.title)) return { id: alt.id || null, title: alt.title || null };
-
   return null;
 }
 
-/* Webhook: show intro + interactive buttons. When user chooses, send link + pdf */
+/* Main webhook handler */
 app.post("/webhook", async (req, res) => {
   try {
     if (VERIFY_TOKEN) {
@@ -179,58 +193,87 @@ app.post("/webhook", async (req, res) => {
     }
 
     const incoming = extractCommon(req.body);
+
+    // ignore statuses (delivery/read) events
+    if (incoming.kind === "status" || incoming.kind === "statuses") {
+      console.log("Received statuses event - ignoring");
+      return res.status(200).send("ignored-status");
+    }
+
+    if (incoming.kind !== "message") {
+      console.log("Unknown webhook kind - ignoring", JSON.stringify(incoming.raw).slice(0,300));
+      return res.status(200).send("ignored");
+    }
+
+    // ignore if this is an echo of our own sent message
+    if (incoming.from_me) {
+      console.log("Ignoring from_me echo");
+      return res.status(200).send("ignored-from-me");
+    }
+
     let messageId = incoming.messageId || Date.now().toString();
-    let from = incoming.from;
+    let rawFrom = incoming.from;
+    let from = normalizePhone(rawFrom);
+
+    // If SENDER_PHONE is configured, ignore messages that come from that phone (your own)
+    if (SENDER_PHONE) {
+      const normSender = normalizePhone(SENDER_PHONE);
+      if (normSender && from === normSender) {
+        console.log("Ignoring message from configured sender phone (self)");
+        return res.status(200).send("ignored-self");
+      }
+    }
+
     if (!from) {
-      console.warn("no 'from' in incoming payload:", JSON.stringify(incoming.raw || req.body).slice(0,400));
+      console.warn("no 'from' in incoming payload or invalid format:", JSON.stringify(incoming.raw || req.body).slice(0,400));
       return res.status(400).send("missing-sender");
     }
-    // normalize jid -> phone
-    if (typeof from === "string" && from.includes("@")) from = from.split("@")[0];
 
     // dedupe
     if (dedupe.get(messageId)) {
-      console.log("duplicate webhook ignored", messageId);
+      console.log("Duplicate webhook ignored", messageId);
       return res.status(200).send("ok");
     }
     dedupe.set(messageId, true);
 
-    // If the inbound is an interactive reply (button press), handle selection
-    const button = extractButtonReply(req.body);
-    if (button && button.id) {
-      console.log("Detected button reply:", button);
-      const id = String(button.id).toLowerCase();
-      if (id === "tv" || id === process.env.TV_BUTTON_ID?.toLowerCase()) {
-        // send TV link + pdf
+    // If user clicked a button, handle it
+    const buttonReply = extractButtonReply(req.body);
+    if (buttonReply && buttonReply.id) {
+      const id = String(buttonReply.id).toLowerCase();
+      console.log("Button reply detected:", id, buttonReply.title);
+
+      if (id === "tv" || id === (process.env.TV_BUTTON_ID || "tv").toLowerCase()) {
         try {
           await sendText(from, TV_LINK);
           await sendDocument(from, TV_MEDIA_ID);
-          console.log("Sent TV link & PDF to", from);
+          console.log("Sent TV link + PDF to", from);
           return res.status(200).send("tv-sent");
         } catch (err) {
           console.error("Failed to send TV assets:", err?.response?.status, err?.response?.data || err.message);
           return res.status(502).send("tv-send-failed");
         }
       }
-      if (id === "ac" || id === process.env.AC_BUTTON_ID?.toLowerCase()) {
+
+      if (id === "ac" || id === (process.env.AC_BUTTON_ID || "ac").toLowerCase()) {
         try {
           await sendText(from, AC_LINK);
           await sendDocument(from, AC_MEDIA_ID);
-          console.log("Sent AC link & PDF to", from);
+          console.log("Sent AC link + PDF to", from);
           return res.status(200).send("ac-sent");
         } catch (err) {
           console.error("Failed to send AC assets:", err?.response?.status, err?.response?.data || err.message);
           return res.status(502).send("ac-send-failed");
         }
       }
-      // unknown id -> reply with clarifying text
+
+      // unknown button id
       await sendText(from, "Sorry, I didn't recognize that option. Please try again.");
       return res.status(200).send("unknown-button");
     }
 
-    // If incoming is plain text equal to TV/AC, handle that too (user may type)
-    const replyText = (incoming.text || "").trim().toLowerCase();
-    if (replyText === (TV_BUTTON_TITLE || "tv").toLowerCase() || replyText === "tv") {
+    // If user typed plain text matching button titles, handle that as fallback
+    const typed = (incoming.text || "").trim().toLowerCase();
+    if (typed === TV_BUTTON_TITLE.toLowerCase() || typed === "tv") {
       try {
         await sendText(from, TV_LINK);
         await sendDocument(from, TV_MEDIA_ID);
@@ -241,7 +284,7 @@ app.post("/webhook", async (req, res) => {
         return res.status(502).send("tv-send-failed");
       }
     }
-    if (replyText === (AC_BUTTON_TITLE || "ac").toLowerCase() || replyText === "ac") {
+    if (typed === AC_BUTTON_TITLE.toLowerCase() || typed === "ac") {
       try {
         await sendText(from, AC_LINK);
         await sendDocument(from, AC_MEDIA_ID);
@@ -253,13 +296,12 @@ app.post("/webhook", async (req, res) => {
       }
     }
 
-    // Otherwise: fresh incoming user message — send intro text + interactive buttons
+    // Otherwise: fresh incoming user message — send intro + interactive
     try {
-      // Step A: intro text (simple ack)
       await sendText(from, INTRO_TEXT);
     } catch (err) {
       console.warn("Intro text failed:", err?.response?.status, err?.response?.data || err.message);
-      // continue — still try to send interactive
+      // continue to attempt interactive
     }
 
     try {
