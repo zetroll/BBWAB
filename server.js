@@ -238,4 +238,64 @@ app.post("/webhook", async (req, res) => {
           await sendDocument(from, AC_MEDIA_ID);
           console.log("Sent AC link + PDF to", from);
           return res.status(200).send("ac-sent");
-        } catch (err
+        } catch (err) {
+          console.error("Failed to send AC assets:", err?.response?.status, err?.response?.data || err.message);
+          return res.status(502).send("ac-send-failed");
+        }
+      }
+
+      // unknown -> clarify
+      await sendText(from, "Sorry, I didn't recognize that option. Please try again.");
+      return res.status(200).send("unknown-button");
+    }
+
+    // typed fallback
+    const typed = (incoming.text || "").trim().toLowerCase();
+    if (typed === TV_BUTTON_TITLE.toLowerCase() || typed === "tv") {
+      try {
+        await sendText(from, TV_LINK);
+        await sendDocument(from, TV_MEDIA_ID);
+        console.log("Sent TV assets (typed) to", from);
+        return res.status(200).send("tv-sent-typed");
+      } catch (err) {
+        console.error("Failed TV typed send:", err?.response?.data || err.message);
+        return res.status(502).send("tv-send-failed");
+      }
+    }
+    if (typed === AC_BUTTON_TITLE.toLowerCase() || typed === "ac") {
+      try {
+        await sendText(from, AC_LINK);
+        await sendDocument(from, AC_MEDIA_ID);
+        console.log("Sent AC assets (typed) to", from);
+        return res.status(200).send("ac-sent-typed");
+      } catch (err) {
+        console.error("Failed AC typed send:", err?.response?.data || err.message);
+        return res.status(502).send("ac-send-failed");
+      }
+    }
+
+    // otherwise: send intro then interactive buttons (note: intro and interactive bodies are different)
+    try {
+      await sendText(from, INTRO_TEXT);
+    } catch (err) {
+      console.warn("Intro text failed:", err?.response?.status, err?.response?.data || err.message);
+    }
+
+    try {
+      await sendInteractiveButtons(from);
+      console.log("Interactive buttons sent to", from);
+      return res.status(200).send("interactive-sent");
+    } catch (err) {
+      console.error("Interactive send failed:", err?.response?.status, err?.response?.data || err.message);
+      return res.status(502).send("interactive-send-failed");
+    }
+
+  } catch (err) {
+    console.error("Unhandled error in webhook handler:", err);
+    return res.status(500).send("internal-error");
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`Server listening on ${PORT}`);
+});
