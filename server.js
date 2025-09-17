@@ -1,4 +1,56 @@
 /**
+ * server.js - fixed syntax, authoritative Whapi shapes
+ *
+ * Env vars required:
+ *  - SEND_API_KEY
+ *  - MEDIA_ID
+ * Optional:
+ *  - SEND_URL (default https://gate.whapi.cloud/messages/document)
+ *  - SEND_TEXT_URL (default https://gate.whapi.cloud/messages/text)
+ *  - VERIFY_TOKEN, PDF_FILENAME, etc.
+ */
+
+const express = require('express');
+const bodyParser = require('body-parser');
+const axios = require('axios');
+const LRU = require('lru-cache');
+const morgan = require('morgan');
+const FormData = require('form-data');
+
+const app = express();
+app.use(bodyParser.json({ limit: '500kb' }));
+app.use(morgan('combined'));
+
+const PORT = process.env.PORT || 8080;
+const MEDIA_ID = process.env.MEDIA_ID || null;
+const SEND_URL = process.env.SEND_URL || 'https://gate.whapi.cloud/messages/document';
+const SEND_TEXT_URL = process.env.SEND_TEXT_URL || 'https://gate.whapi.cloud/messages/text';
+const SEND_API_KEY = process.env.SEND_API_KEY;
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN || null;
+const PDF_FILENAME = process.env.PDF_FILENAME || 'document.pdf';
+const DEDUPE_TTL_MS = parseInt(process.env.DEDUPE_TTL_MIN || '5', 10) * 60 * 1000;
+const MAX_DEDUPE_ENTRIES = parseInt(process.env.MAX_DEDUPE_ENTRIES || '10000', 10);
+const SEND_TIMEOUT_MS = parseInt(process.env.SEND_TIMEOUT_MS || '10000', 10);
+
+if (!SEND_API_KEY) {
+  console.error('Missing required env var: SEND_API_KEY. Aborting.');
+  process.exit(1);
+}
+
+const dedupe = new LRU({ max: MAX_DEDUPE_ENTRIES, ttl: DEDUPE_TTL_MS });
+
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', media_id_present: !!MEDIA_ID });
+});
+
+/* Robust incoming parser */
+function extractIncoming(body) {
+  if (!body) return { messageId: null, from: null, raw: body };
+
+  if (Array.isArray(body.messages) && body.messages.length > 0) {
+    const m = body.messages[0];
+    return { messageId: m.id || m.msg_id || m.message_id || null, fr
+/**
  * server.js - Whapi.Cloud authoritative shapes:
  *  - Text:   { to: "...", body: "..." } -> POST /messages/text
  *  - Document: { to: "...", media: "<MEDIA_ID>", filename: "...", type: "document" } -> POST /messages/document
