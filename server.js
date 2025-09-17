@@ -1,24 +1,24 @@
 /**
- * server.js
+ * server.js - Final combined file
  *
- * - logAxiosError(tag, err) => prints full axios error info for debugging
- * - /admin/send-doc?to=...&media=... => trigger doc send from inside Railway (optional ADMIN_KEY to protect)
- * - Non-blocking background doc send: quick text returned to user, webhook acked, doc send runs in background
- * - Increased timeouts & retries for doc sends, multipart fallback
+ * - Detailed axios error logging (logAxiosError)
+ * - /admin/send-doc endpoint (protected by ADMIN_KEY if set)
+ * - Non-blocking background sends: text + document are fired in background after ack
+ * - Robust document sending: JSON then multipart fallback, retries, backoff, increased timeout
+ * - Interactive buttons (TV / AC), button id normalization, typed-fallback
+ * - Dedupe, health endpoint, status/from_me ignores
  *
  * Env vars:
  *  - SEND_API_KEY (required)
- *  - INTRO_TEXT, INTERACTIVE_BODY, TV_LINK, TV_MEDIA_ID, AC_LINK, AC_MEDIA_ID, etc (required as before)
- *  - SEND_TEXT_URL (default gate.whapi.cloud/messages/text)
- *  - SEND_DOC_URL  (default gate.whapi.cloud/messages/document)
- *  - SEND_INTERACTIVE_URL (default gate.whapi.cloud/messages/interactive)
+ *  - TV_LINK, TV_MEDIA_ID, AC_LINK, AC_MEDIA_ID, INTRO_TEXT, INTERACTIVE_BODY etc.
+ *  - SEND_TEXT_URL, SEND_DOC_URL, SEND_INTERACTIVE_URL (optional overrides)
  *  - VERIFY_TOKEN (optional)
- *  - SENDER_PHONE (optional)
- *  - PDF_FILENAME (optional, default document.pdf)
+ *  - SENDER_PHONE (optional, to ignore self-echoes)
+ *  - PDF_FILENAME (optional)
  *  - TEXT_TIMEOUT_MS (default 8000)
- *  - DOC_TIMEOUT_MS  (default 30000)
- *  - DOC_RETRIES     (default 1)
- *  - ADMIN_KEY       (optional) - if set, /admin/send-doc requires header X-ADMIN-KEY with this value
+ *  - DOC_TIMEOUT_MS (default 30000)
+ *  - DOC_RETRIES (default 1)
+ *  - ADMIN_KEY (optional)
  */
 
 const express = require("express");
@@ -75,13 +75,12 @@ if (!TV_LINK || !TV_MEDIA_ID || !AC_LINK || !AC_MEDIA_ID) {
 
 /* --------- UTILITIES --------- */
 
-/** Detailed axios error logger for debugging. Use before cutting logs. */
+/** Detailed axios error logger for debugging. */
 function logAxiosError(tag, err) {
   try {
     console.error(`--- ${tag} - Error:`, err?.message || err);
     if (err?.code) console.error(`${tag} - code:`, err.code);
     if (err?.config) {
-      // ensure we don't log huge binaries
       const cfg = {
         url: err.config.url,
         method: err.config.method,
@@ -92,7 +91,6 @@ function logAxiosError(tag, err) {
     }
     if (err?.response) {
       console.error(`${tag} - response.status:`, err.response.status);
-      // headers may be large; truncate
       try {
         console.error(`${tag} - response.headers:`, JSON.stringify(err.response.headers).slice(0, 2000));
       } catch {}
@@ -137,7 +135,7 @@ app.get("/health", (req, res) =>
 
 /* --------- WHAPI SEND HELPERS --------- */
 
-/* send text using authoritative Whapi shape { to, body } */
+/* send text using Whapi shape { to, body } */
 async function sendText(toPhone, bodyText) {
   const headers = { Authorization: `Bearer ${SEND_API_KEY}`, "Content-Type": "application/json" };
   const payload = { to: String(toPhone), body: String(bodyText) };
@@ -221,7 +219,7 @@ async function sendInteractiveButtons(toPhone) {
   return axios.post(SEND_INTERACTIVE_URL, payload, { headers, timeout: TEXT_TIMEOUT_MS });
 }
 
-/* extract incoming and ignore statuses/from_me echoes */
+/* extract incoming and ignore statuses/from_me */
 function extractCommon(body) {
   if (!body) return { kind: "unknown", raw: body };
   if (Array.isArray(body.statuses) && body.statuses.length > 0) return { kind: "status", statuses: body.statuses, raw: body };
@@ -259,7 +257,6 @@ function normalizeButtonId(rawId) {
 }
 
 /* --------- ADMIN endpoint - run doc send from server environment --------- */
-/* Optional protection: if ADMIN_KEY is set, require header X-ADMIN-KEY */
 app.post("/admin/send-doc", async (req, res) => {
   try {
     if (ADMIN_KEY) {
@@ -270,7 +267,6 @@ app.post("/admin/send-doc", async (req, res) => {
     const media = req.query.media;
     if (!to || !media) return res.status(400).json({ ok: false, error: "missing to or media query params (use ?to=...&media=...)" });
 
-    // Normalize to like our webhook
     const normTo = normalizePhone(to) || to;
     try {
       const resp = await sendDocumentRobust(normTo, media);
@@ -339,20 +335,20 @@ app.post("/webhook", async (req, res) => {
       const normalizedId = normalizeButtonId(btn.id);
       console.log("Button reply detected:", btn.id, btn.title, "->", normalizedId);
 
-      // send text immediately, then ACK webhook, then background doc send
+      // -------- Non-blocking handling for TV --------
       if (normalizedId === (TV_BUTTON_ID || "tv").toLowerCase()) {
-        // send immediate link to user (await so message is posted quickly)
-        try {
-          await sendText(from, TV_LINK);
-        } catch (errText) {
-          logAxiosError("sendText (tv) failed", errText);
-          // still proceed to ack and try sending doc in background
-        }
+        // fire-and-forget text in background
+        (async () => {
+          try {
+            const textResp = await sendText(from, TV_LINK);
+            console.log("Background: TV text send success:", textResp?.status);
+          } catch (errText) {
+            logAxiosError("Background sendText (TV) failed", errText);
+            // could add persistent queue here
+          }
+        })();
 
-        // ACK webhook quickly
-        res.status(200).send("accepted-tv");
-
-        // background doc send (fire-and-forget)
+        // fire-and-forget doc in background (robust)
         (async () => {
           try {
             const r = await sendDocumentRobust(from, TV_MEDIA_ID);
@@ -362,17 +358,20 @@ app.post("/webhook", async (req, res) => {
           }
         })();
 
-        return; // we're done after acking
+        // ack webhook quickly
+        return res.status(200).send("accepted-tv");
       }
 
+      // -------- Non-blocking handling for AC --------
       if (normalizedId === (AC_BUTTON_ID || "ac").toLowerCase()) {
-        try {
-          await sendText(from, AC_LINK);
-        } catch (errText) {
-          logAxiosError("sendText (ac) failed", errText);
-        }
-
-        res.status(200).send("accepted-ac");
+        (async () => {
+          try {
+            const textResp = await sendText(from, AC_LINK);
+            console.log("Background: AC text send success:", textResp?.status);
+          } catch (errText) {
+            logAxiosError("Background sendText (AC) failed", errText);
+          }
+        })();
 
         (async () => {
           try {
@@ -383,7 +382,7 @@ app.post("/webhook", async (req, res) => {
           }
         })();
 
-        return;
+        return res.status(200).send("accepted-ac");
       }
 
       // unknown button id -> immediate feedback and ack
@@ -395,16 +394,18 @@ app.post("/webhook", async (req, res) => {
       return res.status(200).send("unknown-button");
     }
 
-    // typed fallback
+    // typed fallback (non-blocking similar pattern)
     const typed = (incoming.text || "").trim().toLowerCase();
     if (typed === TV_BUTTON_TITLE.toLowerCase() || typed === "tv") {
-      try {
-        await sendText(from, TV_LINK);
-      } catch (errText) {
-        logAxiosError("sendText (tv typed) failed", errText);
-      }
-      // ack quickly then background doc send
-      res.status(200).send("accepted-tv-typed");
+      // background text
+      (async () => {
+        try {
+          await sendText(from, TV_LINK);
+        } catch (errText) {
+          logAxiosError("Background sendText (TV typed) failed", errText);
+        }
+      })();
+      // background doc
       (async () => {
         try {
           await sendDocumentRobust(from, TV_MEDIA_ID);
@@ -413,16 +414,16 @@ app.post("/webhook", async (req, res) => {
           logAxiosError("Background TV typed send failed", errDoc);
         }
       })();
-      return;
+      return res.status(200).send("accepted-tv-typed");
     }
-
     if (typed === AC_BUTTON_TITLE.toLowerCase() || typed === "ac") {
-      try {
-        await sendText(from, AC_LINK);
-      } catch (errText) {
-        logAxiosError("sendText (ac typed) failed", errText);
-      }
-      res.status(200).send("accepted-ac-typed");
+      (async () => {
+        try {
+          await sendText(from, AC_LINK);
+        } catch (errText) {
+          logAxiosError("Background sendText (AC typed) failed", errText);
+        }
+      })();
       (async () => {
         try {
           await sendDocumentRobust(from, AC_MEDIA_ID);
@@ -431,12 +432,11 @@ app.post("/webhook", async (req, res) => {
           logAxiosError("Background AC typed send failed", errDoc);
         }
       })();
-      return;
+      return res.status(200).send("accepted-ac-typed");
     }
 
-    // otherwise: initial user message => intro + interactive buttons (await interactive; then respond normally)
+    // otherwise initial user message => intro + interactive
     try {
-      // send intro (best-effort)
       await sendText(from, INTRO_TEXT);
     } catch (errIntro) {
       logAxiosError("Intro text failed", errIntro);
