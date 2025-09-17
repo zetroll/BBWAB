@@ -1,0 +1,5 @@
+[project]
+name = "whapi-whatsapp-pdf-bot"
+
+[deploy]
+command = "npm start"
