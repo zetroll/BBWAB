@@ -1,24 +1,30 @@
 /**
- * server.js - Final combined file
+ * server.js - prioritized fast-path (document-first) + robust fallbacks + retry queue
  *
- * - Detailed axios error logging (logAxiosError)
- * - /admin/send-doc endpoint (protected by ADMIN_KEY if set)
- * - Non-blocking background sends: text + document are fired in background after ack
- * - Robust document sending: JSON then multipart fallback, retries, backoff, increased timeout
- * - Interactive buttons (TV / AC), button id normalization, typed-fallback
- * - Dedupe, health endpoint, status/from_me ignores
+ * Features:
+ *  - ACK webhook immediately
+ *  - Background: sendDocumentRobust(...) (JSON -> multipart -> retries) - preferred first
+ *  - Background: sendText with short immediate retries, then queue for later retries
+ *  - Filenames set to:
+ *       - "Dilip's Favourite TVs.pdf"
+ *       - "Dilip's Favourite ACs.pdf"
+ *  - Admin endpoints to inspect and re-run failed jobs
  *
- * Env vars:
+ * Env vars (recommended):
  *  - SEND_API_KEY (required)
- *  - TV_LINK, TV_MEDIA_ID, AC_LINK, AC_MEDIA_ID, INTRO_TEXT, INTERACTIVE_BODY etc.
- *  - SEND_TEXT_URL, SEND_DOC_URL, SEND_INTERACTIVE_URL (optional overrides)
- *  - VERIFY_TOKEN (optional)
- *  - SENDER_PHONE (optional, to ignore self-echoes)
- *  - PDF_FILENAME (optional)
- *  - TEXT_TIMEOUT_MS (default 8000)
+ *  - TV_LINK, TV_MEDIA_ID, AC_LINK, AC_MEDIA_ID
+ *  - INTRO_TEXT, INTERACTIVE_BODY (opt)
+ *  - SEND_TEXT_URL,SEND_DOC_URL,SEND_INTERACTIVE_URL (optional)
+ *  - VERIFY_TOKEN (opt)
+ *  - SENDER_PHONE (opt)
+ *  - PDF_FILENAME (unused - we set per-item names)
+ *  - TEXT_TIMEOUT_MS (default 3000) - fast attempts for link sends
+ *  - TEXT_IMMEDIATE_TRIES (default 2)
  *  - DOC_TIMEOUT_MS (default 30000)
  *  - DOC_RETRIES (default 1)
- *  - ADMIN_KEY (optional)
+ *  - JOB_MAX_RETRIES (default 5)
+ *  - JOB_RETRY_BASE_MS (default 2000)
+ *  - ADMIN_KEY (optional) -> protects admin endpoints via X-ADMIN-KEY header
  */
 
 const express = require("express");
@@ -32,7 +38,7 @@ const app = express();
 app.use(bodyParser.json({ limit: "500kb" }));
 app.use(morgan("combined"));
 
-/* --------- CONFIG / ENV --------- */
+/* -------- CONFIG -------- */
 const PORT = process.env.PORT || 8080;
 const SEND_API_KEY = process.env.SEND_API_KEY;
 const SEND_TEXT_URL = process.env.SEND_TEXT_URL || "https://gate.whapi.cloud/messages/text";
@@ -52,30 +58,31 @@ const AC_MEDIA_ID = process.env.AC_MEDIA_ID || "";
 
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || null;
 const SENDER_PHONE = process.env.SENDER_PHONE || null;
-const PDF_FILENAME = process.env.PDF_FILENAME || "document.pdf";
+
+const TEXT_TIMEOUT_MS = parseInt(process.env.TEXT_TIMEOUT_MS || "3000", 10); // short attempts for perceived speed
+const TEXT_IMMEDIATE_TRIES = parseInt(process.env.TEXT_IMMEDIATE_TRIES || "2", 10);
+const DOC_TIMEOUT_MS = parseInt(process.env.DOC_TIMEOUT_MS || "30000", 10);
+const DOC_RETRIES = parseInt(process.env.DOC_RETRIES || "1", 10);
+
+const JOB_MAX_RETRIES = parseInt(process.env.JOB_MAX_RETRIES || "5", 10);
+const JOB_RETRY_BASE_MS = parseInt(process.env.JOB_RETRY_BASE_MS || "2000", 10);
+const ADMIN_KEY = process.env.ADMIN_KEY || null;
 
 const DEDUPE_TTL_MIN = parseInt(process.env.DEDUPE_TTL_MIN || "5", 10);
 const DEDUPE_TTL_MS = DEDUPE_TTL_MIN * 60 * 1000;
 const MAX_DEDUPE_ENTRIES = parseInt(process.env.MAX_DEDUPE_ENTRIES || "10000", 10);
 
-// Tunables for performance/debugging
-const TEXT_TIMEOUT_MS = parseInt(process.env.TEXT_TIMEOUT_MS || "8000", 10);
-const DOC_TIMEOUT_MS = parseInt(process.env.DOC_TIMEOUT_MS || "30000", 10); // increase if needed
-const DOC_RETRIES = parseInt(process.env.DOC_RETRIES || "1", 10);
-const ADMIN_KEY = process.env.ADMIN_KEY || null; // optional admin protection
-
 if (!SEND_API_KEY) {
-  console.error("Missing SEND_API_KEY. Aborting.");
+  console.error("Missing SEND_API_KEY - aborting.");
   process.exit(1);
 }
 if (!TV_LINK || !TV_MEDIA_ID || !AC_LINK || !AC_MEDIA_ID) {
-  console.error("Missing TV/AC link or media env vars. Aborting.");
+  console.error("Missing one of TV/AC link or media env vars - aborting.");
   process.exit(1);
 }
 
-/* --------- UTILITIES --------- */
+/* -------- UTIL -------- */
 
-/** Detailed axios error logger for debugging. */
 function logAxiosError(tag, err) {
   try {
     console.error(`--- ${tag} - Error:`, err?.message || err);
@@ -91,118 +98,201 @@ function logAxiosError(tag, err) {
     }
     if (err?.response) {
       console.error(`${tag} - response.status:`, err.response.status);
-      try {
-        console.error(`${tag} - response.headers:`, JSON.stringify(err.response.headers).slice(0, 2000));
-      } catch {}
-      try {
-        console.error(`${tag} - response.body:`, JSON.stringify(err.response.data).slice(0, 8000));
-      } catch {
-        console.error(`${tag} - response.body: (could not stringify)`);
-      }
+      try { console.error(`${tag} - response.headers:`, JSON.stringify(err.response.headers).slice(0, 2000)); } catch {}
+      try { console.error(`${tag} - response.body:`, JSON.stringify(err.response.data).slice(0, 8000)); } catch {}
     }
-  } catch (ex) {
-    console.error("Failed to log axios error fully", ex);
-  }
+  } catch (ex) { console.error("Failed to log axios error fully", ex); }
 }
 
-/* normalize phone/JID into accepted `to` form */
 function normalizePhone(raw) {
   if (!raw || typeof raw !== "string") return null;
   raw = raw.trim();
   if (raw.includes("@")) {
     const parts = raw.split("@");
-    let user = parts[0].replace(/\D+/g, "");
+    const user = parts[0].replace(/\D+/g, "");
     const domain = parts.slice(1).join("@");
     if (!user) return null;
     return `${user}@${domain}`;
-  } else {
-    const digits = raw.replace(/\D+/g, "");
-    return digits.length >= 9 ? digits : null;
   }
+  const digits = raw.replace(/\D+/g, "");
+  return digits.length >= 9 ? digits : null;
 }
 
-/* small sleep helper for backoff */
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
-/* --------- DEDUPE / HEALTH --------- */
 const dedupe = new LRU({ max: MAX_DEDUPE_ENTRIES, ttl: DEDUPE_TTL_MS });
 
-app.get("/health", (req, res) =>
-  res.json({ status: "ok", tv_media: !!TV_MEDIA_ID, ac_media: !!AC_MEDIA_ID })
-);
+app.get("/health", (req, res) => res.json({ ok: true }));
 
-/* --------- WHAPI SEND HELPERS --------- */
+/* -------- JOB QUEUE (in-memory) --------
+   Job schema:
+   {
+     id: string,
+     type: 'text'|'doc',
+     to: string,
+     body?: string,          // for text
+     media?: string,         // for doc
+     filename?: string,      // for doc filename
+     attempts: number,
+     maxAttempts: number,
+     nextAttemptAt: number
+   }
+*/
+const jobs = new Map();
+let jobCounter = 0;
 
-/* send text using Whapi shape { to, body } */
-async function sendText(toPhone, bodyText) {
-  const headers = { Authorization: `Bearer ${SEND_API_KEY}`, "Content-Type": "application/json" };
-  const payload = { to: String(toPhone), body: String(bodyText) };
-  return axios.post(SEND_TEXT_URL, payload, { headers, timeout: TEXT_TIMEOUT_MS });
+function makeJobId() { jobCounter++; return `${Date.now()}-${jobCounter}`; }
+function addJob(job) {
+  jobs.set(job.id, job);
+  console.log("Queued job", job.id, job.type, "attempts", job.attempts, "nextAt", new Date(job.nextAttemptAt).toISOString());
 }
 
-/* single-attempt JSON document send */
-async function sendDocumentJsonOnce(toPhone, mediaId, timeoutMs) {
+/* Job worker: periodically scan jobs and attempt those ready to run */
+const JOB_WORKER_INTERVAL_MS = 2000;
+setInterval(async () => {
+  const now = Date.now();
+  for (const [id, job] of Array.from(jobs.entries())) {
+    if (job.nextAttemptAt > now) continue;
+    // process
+    console.log("Processing job", id, job.type, "attempt", job.attempts + 1, "/", job.maxAttempts);
+    try {
+      if (job.type === "doc") {
+        await sendDocumentRobust(job.to, job.media, job.filename);
+        console.log("Job success doc", id);
+        jobs.delete(id);
+      } else if (job.type === "text") {
+        await sendTextOnce(job.to, job.body, TEXT_TIMEOUT_MS);
+        console.log("Job success text", id);
+        jobs.delete(id);
+      } else {
+        console.warn("Unknown job type", job.type, id);
+        jobs.delete(id);
+      }
+    } catch (err) {
+      job.attempts++;
+      logAxiosError(`Job ${id} failed`, err);
+      if (job.attempts >= job.maxAttempts) {
+        console.error(`Job ${id} exhausted attempts (${job.attempts}) - removing`);
+        jobs.delete(id);
+      } else {
+        // set exponential backoff
+        const backoff = JOB_RETRY_BASE_MS * Math.pow(2, job.attempts - 1);
+        job.nextAttemptAt = Date.now() + backoff;
+        jobs.set(id, job);
+        console.log(`Job ${id} rescheduled in ${backoff}ms`);
+      }
+    }
+  }
+}, JOB_WORKER_INTERVAL_MS);
+
+/* -------- WHAPI helpers -------- */
+
+/* sendTextOnce: single attempt with given timeout - returns axios response */
+async function sendTextOnce(toPhone, body, timeoutMs) {
   const headers = { Authorization: `Bearer ${SEND_API_KEY}`, "Content-Type": "application/json" };
-  const payload = { to: String(toPhone), media: String(mediaId), filename: PDF_FILENAME, type: "document" };
+  const payload = { to: String(toPhone), body: String(body) };
+  return axios.post(SEND_TEXT_URL, payload, { headers, timeout: timeoutMs });
+}
+
+/* send document JSON once (optional filename)*/
+async function sendDocumentJsonOnce(toPhone, mediaId, filename, timeoutMs) {
+  const headers = { Authorization: `Bearer ${SEND_API_KEY}`, "Content-Type": "application/json" };
+  const payload = {
+    to: String(toPhone),
+    media: String(mediaId),
+    filename: filename ? String(filename) : undefined,
+    type: "document"
+  };
   return axios.post(SEND_DOC_URL, payload, { headers, timeout: timeoutMs });
 }
 
-/* single-attempt multipart send */
-async function sendDocumentMultipartOnce(toPhone, mediaId, timeoutMs) {
+/* multipart form attempt */
+async function sendDocumentMultipartOnce(toPhone, mediaId, filename, timeoutMs) {
   const form = new FormData();
   form.append("to", String(toPhone));
   form.append("media", String(mediaId));
-  form.append("filename", PDF_FILENAME);
+  if (filename) form.append("filename", String(filename));
   form.append("type", "document");
   const headers = { Authorization: `Bearer ${SEND_API_KEY}`, ...form.getHeaders() };
-  return axios.post(SEND_DOC_URL, form, { headers, maxContentLength: Infinity, maxBodyLength: Infinity, timeout: timeoutMs });
+  return axios.post(SEND_DOC_URL, form, { headers, timeout: timeoutMs, maxContentLength: Infinity, maxBodyLength: Infinity });
 }
 
-/**
- * Robust document sender: tries JSON then multipart, retries the sequence DOC_RETRIES times with backoff.
- * Returns axios response on success, throws last error on failure.
- */
-async function sendDocumentRobust(toPhone, mediaId) {
+/* Robust document sender used by background tasks and job worker
+   Tries JSON -> multipart, repeats the sequence DOC_RETRIES times (exponential backoff applied by caller or internal)
+*/
+async function sendDocumentRobust(toPhone, mediaId, filename) {
   let lastErr = null;
   for (let attempt = 0; attempt <= DOC_RETRIES; attempt++) {
     const name = `docAttempt#${attempt + 1}`;
     try {
-      console.log(`${name}: trying JSON send (timeout ${DOC_TIMEOUT_MS}ms)`);
-      const resp = await sendDocumentJsonOnce(toPhone, mediaId, DOC_TIMEOUT_MS);
-      console.log(`${name}: JSON success status=${resp.status}`);
-      return resp;
+      console.log(`${name} trying JSON (timeout ${DOC_TIMEOUT_MS}ms) to ${toPhone}`);
+      const r = await sendDocumentJsonOnce(toPhone, mediaId, filename, DOC_TIMEOUT_MS);
+      console.log(`${name} JSON success`, r.status);
+      return r;
     } catch (errJson) {
       lastErr = errJson;
       logAxiosError(`${name} JSON`, errJson);
-      // bail early on auth issues
-      const st = errJson?.response?.status;
-      if (st && [401, 403].includes(st)) throw errJson;
+      // bail on auth
+      const s = errJson?.response?.status;
+      if (s && [401, 403].includes(s)) throw errJson;
 
-      // try multipart fallback for this attempt
       try {
-        console.log(`${name}: trying multipart fallback (timeout ${DOC_TIMEOUT_MS}ms)`);
-        const resp2 = await sendDocumentMultipartOnce(toPhone, mediaId, DOC_TIMEOUT_MS);
-        console.log(`${name}: multipart success status=${resp2.status}`);
-        return resp2;
+        console.log(`${name} trying multipart fallback`);
+        const r2 = await sendDocumentMultipartOnce(toPhone, mediaId, filename, DOC_TIMEOUT_MS);
+        console.log(`${name} multipart success`, r2.status);
+        return r2;
       } catch (errMulti) {
         lastErr = errMulti;
         logAxiosError(`${name} multipart`, errMulti);
-        const st2 = errMulti?.response?.status;
-        if (st2 && [401, 403].includes(st2)) throw errMulti;
+        const s2 = errMulti?.response?.status;
+        if (s2 && [401, 403].includes(s2)) throw errMulti;
       }
     }
     if (attempt < DOC_RETRIES) {
-      const backoff = 1000 * Math.pow(2, attempt); // 1s, 2s, 4s...
-      console.log(`Waiting ${backoff}ms before next doc attempt`);
+      // small wait before next attempt
+      const backoff = 1000 * Math.pow(2, attempt);
+      console.log(`sendDocumentRobust waiting ${backoff}ms before retry`);
       await sleep(backoff);
     }
   }
-  throw lastErr || new Error("Document send failed after retries");
+  throw lastErr || new Error("Document send exhausted attempts");
 }
 
-/* interactive send */
+/* sendTextRobust: short immediate tries, then enqueue a job for further retries */
+async function sendTextRobustOrQueue(toPhone, body) {
+  // try a few quick attempts first (fast perceived behavior)
+  for (let i = 0; i < TEXT_IMMEDIATE_TRIES; i++) {
+    try {
+      console.log(`sendTextRobust: quick try ${i + 1} to ${toPhone}`);
+      const r = await sendTextOnce(toPhone, body, TEXT_TIMEOUT_MS);
+      console.log("sendText quick success", r.status);
+      return r;
+    } catch (err) {
+      logAxiosError(`sendText quick try ${i + 1}`, err);
+      // if auth error, bail completely
+      const s = err?.response?.status;
+      if (s && [401, 403].includes(s)) throw err;
+      // otherwise try again quickly
+    }
+  }
+
+  // after quick tries, enqueue the job for retries (JOB_MAX_RETRIES)
+  const jobId = makeJobId();
+  const job = {
+    id: jobId,
+    type: "text",
+    to: toPhone,
+    body,
+    attempts: 0,
+    maxAttempts: JOB_MAX_RETRIES,
+    nextAttemptAt: Date.now() + JOB_RETRY_BASE_MS
+  };
+  addJob(job);
+  console.log("text send queued as job", jobId);
+  return null;
+}
+
+/* -------- interactive helper -------- */
 async function sendInteractiveButtons(toPhone) {
   const headers = { Authorization: `Bearer ${SEND_API_KEY}`, "Content-Type": "application/json" };
   const payload = {
@@ -219,7 +309,7 @@ async function sendInteractiveButtons(toPhone) {
   return axios.post(SEND_INTERACTIVE_URL, payload, { headers, timeout: TEXT_TIMEOUT_MS });
 }
 
-/* extract incoming and ignore statuses/from_me */
+/* -------- extract helpers (same robust shapes) -------- */
 function extractCommon(body) {
   if (!body) return { kind: "unknown", raw: body };
   if (Array.isArray(body.statuses) && body.statuses.length > 0) return { kind: "status", statuses: body.statuses, raw: body };
@@ -241,7 +331,6 @@ function extractCommon(body) {
   return { kind: "unknown", raw: body };
 }
 
-/* robust button reply extractor */
 function extractButtonReply(body) {
   if (!body) return null;
   const m = (body.messages && body.messages[0]) || body.message || body;
@@ -256,69 +345,83 @@ function normalizeButtonId(rawId) {
   return parts[parts.length - 1].toLowerCase();
 }
 
-/* --------- ADMIN endpoint - run doc send from server environment --------- */
+/* -------- ADMIN endpoints -------- */
 app.post("/admin/send-doc", async (req, res) => {
+  if (ADMIN_KEY) {
+    const key = req.headers["x-admin-key"];
+    if (!key || key !== ADMIN_KEY) return res.status(401).json({ ok: false, error: "invalid admin key" });
+  }
+  const to = req.query.to;
+  const media = req.query.media;
+  const name = req.query.name || "test.pdf";
+  if (!to || !media) return res.status(400).json({ ok: false, error: "missing to or media query params" });
   try {
-    if (ADMIN_KEY) {
-      const key = req.headers["x-admin-key"];
-      if (!key || key !== ADMIN_KEY) return res.status(401).json({ ok: false, error: "invalid admin key" });
-    }
-    const to = req.query.to;
-    const media = req.query.media;
-    if (!to || !media) return res.status(400).json({ ok: false, error: "missing to or media query params (use ?to=...&media=...)" });
-
-    const normTo = normalizePhone(to) || to;
-    try {
-      const resp = await sendDocumentRobust(normTo, media);
-      return res.status(200).json({ ok: true, status: resp.status, body: resp.data });
-    } catch (err) {
-      logAxiosError("admin send-doc", err);
-      return res.status(500).json({ ok: false, error: err?.message || "send failed" });
-    }
-  } catch (ex) {
-    console.error("admin/send-doc error", ex);
-    return res.status(500).json({ ok: false, error: "server error" });
+    const r = await sendDocumentRobust(normalizePhone(to) || to, media, name);
+    return res.json({ ok: true, status: r.status, body: r.data });
+  } catch (err) {
+    logAxiosError("admin send-doc", err);
+    return res.status(500).json({ ok: false, error: err?.message || "failed" });
   }
 });
 
-/* --------- MAIN WEBHOOK --------- */
+app.get("/admin/failed-jobs", (req, res) => {
+  if (ADMIN_KEY) {
+    const key = req.headers["x-admin-key"];
+    if (!key || key !== ADMIN_KEY) return res.status(401).json({ ok: false, error: "invalid admin key" });
+  }
+  const list = Array.from(jobs.values()).map((j) => ({ id: j.id, type: j.type, to: j.to, attempts: j.attempts, nextAttemptAt: j.nextAttemptAt }));
+  return res.json({ ok: true, queued: list });
+});
+
+app.post("/admin/retry-job", (req, res) => {
+  if (ADMIN_KEY) {
+    const key = req.headers["x-admin-key"];
+    if (!key || key !== ADMIN_KEY) return res.status(401).json({ ok: false, error: "invalid admin key" });
+  }
+  const jobId = req.query.jobId;
+  if (!jobId) return res.status(400).json({ ok: false, error: "jobId required" });
+  const job = jobs.get(jobId);
+  if (!job) return res.status(404).json({ ok: false, error: "job not found" });
+  job.nextAttemptAt = Date.now();
+  jobs.set(jobId, job);
+  return res.json({ ok: true, message: "job scheduled" });
+});
+
+/* -------- MAIN WEBHOOK -------- */
 app.post("/webhook", async (req, res) => {
   try {
     if (VERIFY_TOKEN) {
       const token = req.headers["x-whapi-token"] || req.headers["x-webhook-token"] || null;
-      if (token !== VERIFY_TOKEN) {
-        console.warn("invalid webhook token");
-        return res.status(401).send("invalid token");
-      }
+      if (token !== VERIFY_TOKEN) return res.status(401).send("invalid token");
     }
 
     const incoming = extractCommon(req.body);
 
     if (incoming.kind === "status") {
-      console.log("Received statuses event - ignoring");
+      console.log("statuses event - ignoring");
       return res.status(200).send("ignored-status");
     }
     if (incoming.kind !== "message") {
-      console.log("Unknown webhook kind - ignoring", JSON.stringify(incoming.raw).slice(0,300));
+      console.log("unknown webhook kind - ignoring");
       return res.status(200).send("ignored");
     }
     if (incoming.from_me) {
-      console.log("Ignoring from_me echo");
+      console.log("ignoring from_me echo");
       return res.status(200).send("ignored-from-me");
     }
 
     const messageId = incoming.messageId || Date.now().toString();
-    const rawFrom = incoming.from;
-    const from = normalizePhone(rawFrom);
+    let rawFrom = incoming.from;
+    let from = normalizePhone(rawFrom);
     if (!from) {
-      console.warn("no 'from' in incoming payload or invalid format:", JSON.stringify(incoming.raw).slice(0,400));
+      console.warn("invalid from:", JSON.stringify(incoming.raw).slice(0, 300));
       return res.status(400).send("missing-sender");
     }
 
     if (SENDER_PHONE) {
       const normSender = normalizePhone(SENDER_PHONE);
       if (normSender && from === normSender) {
-        console.log("Ignoring message from configured sender phone (self)");
+        console.log("Ignoring self messages");
         return res.status(200).send("ignored-self");
       }
     }
@@ -335,120 +438,96 @@ app.post("/webhook", async (req, res) => {
       const normalizedId = normalizeButtonId(btn.id);
       console.log("Button reply detected:", btn.id, btn.title, "->", normalizedId);
 
-      // -------- Non-blocking handling for TV --------
+      // pick assets
       if (normalizedId === (TV_BUTTON_ID || "tv").toLowerCase()) {
-        // fire-and-forget text in background
+        // filename for TV
+        const filename = "Dilip's Favourite TVs.pdf";
+
+        // Fire-and-forget doc (preferred) AND enqueue/attempt text quickly in parallel.
         (async () => {
           try {
-            const textResp = await sendText(from, TV_LINK);
-            console.log("Background: TV text send success:", textResp?.status);
-          } catch (errText) {
-            logAxiosError("Background sendText (TV) failed", errText);
-            // could add persistent queue here
+            await sendDocumentRobust(from, TV_MEDIA_ID, filename);
+            console.log("background: TV doc sent");
+          } catch (err) {
+            logAxiosError("background TV doc failed", err);
+            // queue doc job
+            const id = makeJobId();
+            addJob({ id, type: "doc", to: from, media: TV_MEDIA_ID, filename, attempts: 0, maxAttempts: JOB_MAX_RETRIES, nextAttemptAt: Date.now() + JOB_RETRY_BASE_MS });
           }
         })();
 
-        // fire-and-forget doc in background (robust)
+        // Try text quickly (short attempts), then queue if still failing
         (async () => {
           try {
-            const r = await sendDocumentRobust(from, TV_MEDIA_ID);
-            console.log("Background: TV document sent:", r?.status);
-          } catch (errDoc) {
-            logAxiosError("Background TV document send failed", errDoc);
+            await sendTextRobustOrQueue(from, TV_LINK);
+          } catch (err) {
+            logAxiosError("sendTextRobustOrQueue (tv) fatal", err);
           }
         })();
 
-        // ack webhook quickly
+        // ACK quickly
         return res.status(200).send("accepted-tv");
       }
 
-      // -------- Non-blocking handling for AC --------
       if (normalizedId === (AC_BUTTON_ID || "ac").toLowerCase()) {
+        const filename = "Dilip's Favourite ACs.pdf";
+
         (async () => {
           try {
-            const textResp = await sendText(from, AC_LINK);
-            console.log("Background: AC text send success:", textResp?.status);
-          } catch (errText) {
-            logAxiosError("Background sendText (AC) failed", errText);
+            await sendDocumentRobust(from, AC_MEDIA_ID, filename);
+            console.log("background: AC doc sent");
+          } catch (err) {
+            logAxiosError("background AC doc failed", err);
+            const id = makeJobId();
+            addJob({ id, type: "doc", to: from, media: AC_MEDIA_ID, filename, attempts: 0, maxAttempts: JOB_MAX_RETRIES, nextAttemptAt: Date.now() + JOB_RETRY_BASE_MS });
           }
         })();
 
         (async () => {
           try {
-            const r = await sendDocumentRobust(from, AC_MEDIA_ID);
-            console.log("Background: AC document sent:", r?.status);
-          } catch (errDoc) {
-            logAxiosError("Background AC document send failed", errDoc);
+            await sendTextRobustOrQueue(from, AC_LINK);
+          } catch (err) {
+            logAxiosError("sendTextRobustOrQueue (ac) fatal", err);
           }
         })();
 
         return res.status(200).send("accepted-ac");
       }
 
-      // unknown button id -> immediate feedback and ack
-      try {
-        await sendText(from, "Sorry, I didn't recognize that option. Please try again.");
-      } catch (errText) {
-        logAxiosError("sendText (unknown button) failed", errText);
-      }
+      // unknown button -> quick reply then ack
+      (async () => {
+        try { await sendTextOnce(from, "Sorry, I didn't recognize that option. Please try again.", TEXT_TIMEOUT_MS); } catch (e) { logAxiosError("unknown-button text", e); }
+      })();
       return res.status(200).send("unknown-button");
     }
 
-    // typed fallback (non-blocking similar pattern)
+    // typed fallback (non-blocking)
     const typed = (incoming.text || "").trim().toLowerCase();
     if (typed === TV_BUTTON_TITLE.toLowerCase() || typed === "tv") {
-      // background text
+      const filename = "Dilip's Favourite TVs.pdf";
       (async () => {
-        try {
-          await sendText(from, TV_LINK);
-        } catch (errText) {
-          logAxiosError("Background sendText (TV typed) failed", errText);
-        }
+        try { await sendDocumentRobust(from, TV_MEDIA_ID, filename); } catch (err) { logAxiosError("typed TV doc failed", err); const id = makeJobId(); addJob({ id, type: "doc", to: from, media: TV_MEDIA_ID, filename, attempts: 0, maxAttempts: JOB_MAX_RETRIES, nextAttemptAt: Date.now() + JOB_RETRY_BASE_MS }); }
       })();
-      // background doc
-      (async () => {
-        try {
-          await sendDocumentRobust(from, TV_MEDIA_ID);
-          console.log("Background: TV typed doc sent");
-        } catch (errDoc) {
-          logAxiosError("Background TV typed send failed", errDoc);
-        }
-      })();
+      (async () => { try { await sendTextRobustOrQueue(from, TV_LINK); } catch (err) { logAxiosError("typed TV text fatal", err); } })();
       return res.status(200).send("accepted-tv-typed");
     }
     if (typed === AC_BUTTON_TITLE.toLowerCase() || typed === "ac") {
+      const filename = "Dilip's Favourite ACs.pdf";
       (async () => {
-        try {
-          await sendText(from, AC_LINK);
-        } catch (errText) {
-          logAxiosError("Background sendText (AC typed) failed", errText);
-        }
+        try { await sendDocumentRobust(from, AC_MEDIA_ID, filename); } catch (err) { logAxiosError("typed AC doc failed", err); const id = makeJobId(); addJob({ id, type: "doc", to: from, media: AC_MEDIA_ID, filename, attempts: 0, maxAttempts: JOB_MAX_RETRIES, nextAttemptAt: Date.now() + JOB_RETRY_BASE_MS }); }
       })();
-      (async () => {
-        try {
-          await sendDocumentRobust(from, AC_MEDIA_ID);
-          console.log("Background: AC typed doc sent");
-        } catch (errDoc) {
-          logAxiosError("Background AC typed send failed", errDoc);
-        }
-      })();
+      (async () => { try { await sendTextRobustOrQueue(from, AC_LINK); } catch (err) { logAxiosError("typed AC text fatal", err); } })();
       return res.status(200).send("accepted-ac-typed");
     }
 
-    // otherwise initial user message => intro + interactive
-    try {
-      await sendText(from, INTRO_TEXT);
-    } catch (errIntro) {
-      logAxiosError("Intro text failed", errIntro);
-      // continue to interactive attempt
-    }
-
+    // otherwise: initial inbound -> intro + interactive buttons (best-effort)
+    (async () => { try { await sendTextOnce(from, INTRO_TEXT, TEXT_TIMEOUT_MS); } catch (errIntro) { logAxiosError("intro text failed", errIntro); } })();
     try {
       await sendInteractiveButtons(from);
-      console.log("Interactive buttons sent to", from);
+      console.log("interactive sent");
       return res.status(200).send("interactive-sent");
     } catch (errInteractive) {
-      logAxiosError("Interactive send failed", errInteractive);
+      logAxiosError("interactive failed", errInteractive);
       return res.status(502).send("interactive-send-failed");
     }
   } catch (err) {
@@ -457,7 +536,5 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-/* --------- START --------- */
-app.listen(PORT, () => {
-  console.log(`Server listening on ${PORT}`);
-});
+/* -------- START -------- */
+app.listen(PORT, () => console.log(`Server listening ${PORT}`));
