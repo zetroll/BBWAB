@@ -34,12 +34,19 @@ const INTRO_TEXT = process.env.INTRO_TEXT || "Hi, I'm Dileep, and I want to shar
 const INTERACTIVE_BODY = process.env.INTERACTIVE_BODY || "Choose which category you are interested in:";
 const TV_BUTTON_TITLE = process.env.TV_BUTTON_TITLE || "TV";
 const TV_BUTTON_ID = process.env.TV_BUTTON_ID || "tv";
-const TV_LINK = process.env.TV_LINK || "";
 const TV_MEDIA_ID = process.env.TV_MEDIA_ID || "";
 const AC_BUTTON_TITLE = process.env.AC_BUTTON_TITLE || "AC";
 const AC_BUTTON_ID = process.env.AC_BUTTON_ID || "ac";
-const AC_LINK = process.env.AC_LINK || "";
 const AC_MEDIA_ID = process.env.AC_MEDIA_ID || "";
+const REFRIGERATOR_BUTTON_TITLE = process.env.REFRIGERATOR_BUTTON_TITLE || "Refrigerator";
+const REFRIGERATOR_BUTTON_ID = process.env.REFRIGERATOR_BUTTON_ID || "refrigerator";
+const REFRIGERATOR_MEDIA_ID = process.env.REFRIGERATOR_MEDIA_ID || "";
+const WASHING_MACHINE_BUTTON_TITLE = process.env.WASHING_MACHINE_BUTTON_TITLE || "Washing Machine";
+const WASHING_MACHINE_BUTTON_ID = process.env.WASHING_MACHINE_BUTTON_ID || "washing_machine";
+const WASHING_MACHINE_MEDIA_ID = process.env.WASHING_MACHINE_MEDIA_ID || "";
+const KITCHEN_HOME_BUTTON_TITLE = process.env.KITCHEN_HOME_BUTTON_TITLE || "Kitchen & Home Deals";
+const KITCHEN_HOME_BUTTON_ID = process.env.KITCHEN_HOME_BUTTON_ID || "kitchen_home";
+const KITCHEN_HOME_MEDIA_ID = process.env.KITCHEN_HOME_MEDIA_ID || "";
 
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || null;
 const SENDER_PHONE = process.env.SENDER_PHONE || null;
@@ -71,8 +78,8 @@ if (!SEND_API_KEY) {
   console.error("Missing SEND_API_KEY - aborting.");
   process.exit(1);
 }
-if (!TV_LINK || !TV_MEDIA_ID || !AC_LINK || !AC_MEDIA_ID) {
-  console.error("Missing one of TV/AC link or media env vars - aborting.");
+if (!TV_MEDIA_ID || !AC_MEDIA_ID || !REFRIGERATOR_MEDIA_ID || !WASHING_MACHINE_MEDIA_ID || !KITCHEN_HOME_MEDIA_ID) {
+  console.error("Missing one or more media IDs for categories - aborting.");
   process.exit(1);
 }
 
@@ -543,7 +550,10 @@ async function sendInteractiveButtons(toPhone) {
     action: {
       buttons: [
         { type: "quick_reply", title: TV_BUTTON_TITLE, id: TV_BUTTON_ID },
-        { type: "quick_reply", title: AC_BUTTON_TITLE, id: AC_BUTTON_ID }
+        { type: "quick_reply", title: AC_BUTTON_TITLE, id: AC_BUTTON_ID },
+        { type: "quick_reply", title: REFRIGERATOR_BUTTON_TITLE, id: REFRIGERATOR_BUTTON_ID },
+        { type: "quick_reply", title: WASHING_MACHINE_BUTTON_TITLE, id: WASHING_MACHINE_BUTTON_ID },
+        { type: "quick_reply", title: KITCHEN_HOME_BUTTON_TITLE, id: KITCHEN_HOME_BUTTON_ID }
       ]
     },
     type: "button",
@@ -600,6 +610,29 @@ function normalizeButtonId(rawId) {
   if (!rawId) return null;
   const parts = String(rawId).split(":");
   return parts[parts.length - 1].toLowerCase();
+}
+
+// Category-specific success messages with emojis
+function getCategoryMessage(categoryId) {
+  const messages = {
+    'tv': 'Bada screen aur bhi bada drama! 📺 Yeh raha saare ke saare TV deals – just for you.',
+    'ac': 'Kaafi cool choice! ❄️ Yeh rahe best deals on AC – all at ₹100/day!',
+    'refrigerator': 'Serving cool vibes only! 🧊 Saari ki saari cool deals are here!',
+    'washing_machine': 'Ab hogi sirf kaapdo ki dhulayi! 🌀 Here are your deals on Washing Machine!',
+    'kitchen_home': 'Ghar ke har kone ke liye ek deal 🏠 only and only for you!'
+  };
+  return messages[categoryId] || 'Here are your deals!';
+}
+
+function getCategoryData(categoryId) {
+  const categoryMap = {
+    'tv': { mediaId: TV_MEDIA_ID, filename: "Dilip's Favourite TVs.pdf" },
+    'ac': { mediaId: AC_MEDIA_ID, filename: "Dilip's Favourite ACs.pdf" },
+    'refrigerator': { mediaId: REFRIGERATOR_MEDIA_ID, filename: "Dilip's Favourite Refrigerators.pdf" },
+    'washing_machine': { mediaId: WASHING_MACHINE_MEDIA_ID, filename: "Dilip's Favourite Washing Machines.pdf" },
+    'kitchen_home': { mediaId: KITCHEN_HOME_MEDIA_ID, filename: "Dilip's Kitchen & Home Deals.pdf" }
+  };
+  return categoryMap[categoryId];
 }
 
 /* -------- ADMIN endpoints -------- */
@@ -717,52 +750,38 @@ app.post("/webhook", async (req, res) => {
       const normalizedId = normalizeButtonId(btn.id);
       console.log("Button reply detected:", btn.id, btn.title, "->", normalizedId);
 
-      // pick assets
-      if (normalizedId === (TV_BUTTON_ID || "tv").toLowerCase()) {
-        const filename = "Dilip's Favourite TVs.pdf";
+      // Get category data
+      const categoryData = getCategoryData(normalizedId);
 
-        // Document-first background (non-blocking)
+      if (categoryData) {
+        const { mediaId, filename } = categoryData;
+        const successMessage = getCategoryMessage(normalizedId);
+
+        // Send success message first
         (async () => {
           try {
-            await sendDocumentRobust(from, TV_MEDIA_ID, filename);
-            console.log("background: TV doc sent");
+            await sendTextOnce(from, successMessage, TEXT_TIMEOUT_MS);
+            console.log(`${normalizedId} success message sent`);
           } catch (err) {
-            logAxiosError("background TV doc failed", err);
+            logAxiosError(`${normalizedId} success message failed`, err);
+          }
+        })();
+
+        // Then send PDF
+        (async () => {
+          try {
+            await sendDocumentRobust(from, mediaId, filename);
+            console.log(`background: ${normalizedId} doc sent (flow complete)`);
+          } catch (err) {
+            logAxiosError(`background ${normalizedId} doc failed`, err);
             // queue doc job with fingerprint
             const id = makeJobId();
-            const fingerprint = createMessageFingerprint(from, { media: TV_MEDIA_ID }, 'document');
-            addJob({ id, type: "doc", to: from, media: TV_MEDIA_ID, filename, fingerprint, attempts: 0, maxAttempts: JOB_MAX_RETRIES, nextAttemptAt: Date.now() + JOB_RETRY_BASE_MS, locked: false });
+            const fingerprint = createMessageFingerprint(from, { media: mediaId }, 'document');
+            addJob({ id, type: "doc", to: from, media: mediaId, filename, fingerprint, attempts: 0, maxAttempts: JOB_MAX_RETRIES, nextAttemptAt: Date.now() + JOB_RETRY_BASE_MS, locked: false });
           }
         })();
 
-        // text tries + fallback queue
-        (async () => {
-          try { await sendTextRobustOrQueue(from, TV_LINK); } catch (err) { logAxiosError("sendTextRobustOrQueue (tv) fatal", err); }
-        })();
-
-        return res.status(200).send("accepted-tv");
-      }
-
-      if (normalizedId === (AC_BUTTON_ID || "ac").toLowerCase()) {
-        const filename = "Dilip's Favourite ACs.pdf";
-
-        (async () => {
-          try {
-            await sendDocumentRobust(from, AC_MEDIA_ID, filename);
-            console.log("background: AC doc sent");
-          } catch (err) {
-            logAxiosError("background AC doc failed", err);
-            const id = makeJobId();
-            const fingerprint = createMessageFingerprint(from, { media: AC_MEDIA_ID }, 'document');
-            addJob({ id, type: "doc", to: from, media: AC_MEDIA_ID, filename, fingerprint, attempts: 0, maxAttempts: JOB_MAX_RETRIES, nextAttemptAt: Date.now() + JOB_RETRY_BASE_MS, locked: false });
-          }
-        })();
-
-        (async () => {
-          try { await sendTextRobustOrQueue(from, AC_LINK); } catch (err) { logAxiosError("sendTextRobustOrQueue (ac) fatal", err); }
-        })();
-
-        return res.status(200).send("accepted-ac");
+        return res.status(200).send(`accepted-${normalizedId}`);
       }
 
       // unknown button
@@ -770,23 +789,51 @@ app.post("/webhook", async (req, res) => {
       return res.status(200).send("unknown-button");
     }
 
-    // typed fallback
+    // typed fallback - check all categories
     const typed = (incoming.text || "").trim().toLowerCase();
-    if (typed === TV_BUTTON_TITLE.toLowerCase() || typed === "tv") {
-      const filename = "Dilip's Favourite TVs.pdf";
-      (async () => {
-        try { await sendDocumentRobust(from, TV_MEDIA_ID, filename); } catch (err) { logAxiosError("typed TV doc failed", err); const id = makeJobId(); const fingerprint = createMessageFingerprint(from, { media: TV_MEDIA_ID }, 'document'); addJob({ id, type: "doc", to: from, media: TV_MEDIA_ID, filename, fingerprint, attempts: 0, maxAttempts: JOB_MAX_RETRIES, nextAttemptAt: Date.now() + JOB_RETRY_BASE_MS, locked: false }); }
-      })();
-      (async () => { try { await sendTextRobustOrQueue(from, TV_LINK); } catch (err) { logAxiosError("typed TV text fatal", err); } })();
-      return res.status(200).send("accepted-tv-typed");
-    }
-    if (typed === AC_BUTTON_TITLE.toLowerCase() || typed === "ac") {
-      const filename = "Dilip's Favourite ACs.pdf";
-      (async () => {
-        try { await sendDocumentRobust(from, AC_MEDIA_ID, filename); } catch (err) { logAxiosError("typed AC doc failed", err); const id = makeJobId(); const fingerprint = createMessageFingerprint(from, { media: AC_MEDIA_ID }, 'document'); addJob({ id, type: "doc", to: from, media: AC_MEDIA_ID, filename, fingerprint, attempts: 0, maxAttempts: JOB_MAX_RETRIES, nextAttemptAt: Date.now() + JOB_RETRY_BASE_MS, locked: false }); }
-      })();
-      (async () => { try { await sendTextRobustOrQueue(from, AC_LINK); } catch (err) { logAxiosError("typed AC text fatal", err); } })();
-      return res.status(200).send("accepted-ac-typed");
+
+    // Check each category for typed matches
+    const typedMatches = {
+      'tv': [TV_BUTTON_TITLE.toLowerCase(), 'tv', 'television'],
+      'ac': [AC_BUTTON_TITLE.toLowerCase(), 'ac', 'air conditioner'],
+      'refrigerator': [REFRIGERATOR_BUTTON_TITLE.toLowerCase(), 'refrigerator', 'fridge', 'ref'],
+      'washing_machine': [WASHING_MACHINE_BUTTON_TITLE.toLowerCase(), 'washing machine', 'washer', 'washing'],
+      'kitchen_home': [KITCHEN_HOME_BUTTON_TITLE.toLowerCase(), 'kitchen', 'home', 'kitchen home']
+    };
+
+    for (const [categoryId, keywords] of Object.entries(typedMatches)) {
+      if (keywords.some(keyword => typed === keyword)) {
+        const categoryData = getCategoryData(categoryId);
+        if (categoryData) {
+          const { mediaId, filename } = categoryData;
+          const successMessage = getCategoryMessage(categoryId);
+
+          // Send success message first
+          (async () => {
+            try {
+              await sendTextOnce(from, successMessage, TEXT_TIMEOUT_MS);
+              console.log(`typed ${categoryId} success message sent`);
+            } catch (err) {
+              logAxiosError(`typed ${categoryId} success message failed`, err);
+            }
+          })();
+
+          // Then send PDF
+          (async () => {
+            try {
+              await sendDocumentRobust(from, mediaId, filename);
+              console.log(`typed ${categoryId} doc sent (flow complete)`);
+            } catch (err) {
+              logAxiosError(`typed ${categoryId} doc failed`, err);
+              const id = makeJobId();
+              const fingerprint = createMessageFingerprint(from, { media: mediaId }, 'document');
+              addJob({ id, type: "doc", to: from, media: mediaId, filename, fingerprint, attempts: 0, maxAttempts: JOB_MAX_RETRIES, nextAttemptAt: Date.now() + JOB_RETRY_BASE_MS, locked: false });
+            }
+          })();
+
+          return res.status(200).send(`accepted-${categoryId}-typed`);
+        }
+      }
     }
 
     // otherwise initial inbound -> send combined intro + interactive buttons (single API call)
