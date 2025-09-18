@@ -64,6 +64,9 @@ const PHANTOM_DELIVERY_WINDOW_MS = parseInt(process.env.PHANTOM_DELIVERY_WINDOW_
 const RATE_LIMIT_TPS = parseInt(process.env.RATE_LIMIT_TPS || "5", 10);
 const rateLimitWindow = new LRU({ max: 1000, ttl: 1000 }); // 1 second windows
 
+// Outbound message tracking to prevent phantom delivery duplicates
+const outboundMessageCache = new LRU({ max: 10000, ttl: PHANTOM_DELIVERY_WINDOW_MS });
+
 if (!SEND_API_KEY) {
   console.error("Missing SEND_API_KEY - aborting.");
   process.exit(1);
@@ -275,10 +278,20 @@ async function sendTextOnce(toPhone, body, timeoutMs) {
     const resp = await axios.post(SEND_TEXT_URL, payload, { headers, timeout: timeoutMs });
     analyzeWhapiResponse(trace, resp);
     sentCache.set(fingerprint, true);
+
+    // Track outbound message to prevent phantom delivery duplicates
+    const messageKey = `out:${toPhone}:${crypto.createHash('sha256').update(body).digest('hex').slice(0,12)}`;
+    outboundMessageCache.set(messageKey, { fingerprint, timestamp: Date.now(), traceId: trace.id });
+
     console.log(`TRACE ${trace.id}: sendTextOnce SUCCESS (fingerprint: ${fingerprint})`);
     return resp;
   } catch (error) {
     analyzeWhapiResponse(trace, null, error);
+
+    // Even on failure, track the attempt to catch phantom deliveries
+    const messageKey = `out:${toPhone}:${crypto.createHash('sha256').update(body).digest('hex').slice(0,12)}`;
+    outboundMessageCache.set(messageKey, { fingerprint, timestamp: Date.now(), traceId: trace.id, failed: true });
+
     throw error;
   }
 }
@@ -307,10 +320,20 @@ async function sendDocumentJsonOnce(toPhone, mediaId, filename, timeoutMs) {
     const resp = await axios.post(SEND_DOC_URL, payload, { headers, timeout: timeoutMs });
     analyzeWhapiResponse(trace, resp);
     sentCache.set(fingerprint, true);
+
+    // Track outbound document to prevent phantom delivery duplicates
+    const messageKey = `out:${toPhone}:doc:${mediaId}`;
+    outboundMessageCache.set(messageKey, { fingerprint, timestamp: Date.now(), traceId: trace.id });
+
     console.log(`TRACE ${trace.id}: sendDocumentJsonOnce SUCCESS (fingerprint: ${fingerprint})`);
     return resp;
   } catch (error) {
     analyzeWhapiResponse(trace, null, error);
+
+    // Track failed document attempts too
+    const messageKey = `out:${toPhone}:doc:${mediaId}`;
+    outboundMessageCache.set(messageKey, { fingerprint, timestamp: Date.now(), traceId: trace.id, failed: true });
+
     throw error;
   }
 }
@@ -573,6 +596,27 @@ app.post("/webhook", async (req, res) => {
     if (incoming.from_me) {
       console.log("ignoring from_me echo");
       return res.status(200).send("ignored-from-me");
+    }
+
+    // Check for phantom delivery of our own outbound messages
+    if (incoming.text) {
+      const messageKey = `out:${from}:${crypto.createHash('sha256').update(incoming.text).digest('hex').slice(0,12)}`;
+      const outboundRecord = outboundMessageCache.get(messageKey);
+      if (outboundRecord) {
+        console.log(`PHANTOM DELIVERY DETECTED (text): ${messageKey} (original trace: ${outboundRecord.traceId})`);
+        return res.status(200).send("ignored-phantom-delivery");
+      }
+    }
+
+    // Check for phantom delivery of documents
+    if (incoming.raw?.document?.id) {
+      const docId = incoming.raw.document.id;
+      const messageKey = `out:${from}:doc:${docId}`;
+      const outboundRecord = outboundMessageCache.get(messageKey);
+      if (outboundRecord) {
+        console.log(`PHANTOM DELIVERY DETECTED (doc): ${messageKey} (original trace: ${outboundRecord.traceId})`);
+        return res.status(200).send("ignored-phantom-delivery");
+      }
     }
 
     const messageId = incoming.messageId || Date.now().toString();
