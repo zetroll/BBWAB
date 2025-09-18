@@ -135,7 +135,8 @@ function createMessageFingerprint(to, content, type) {
   const normalized = {
     to: normalizePhone(to),
     content: type === 'text' ? content : (content.media || content.body || JSON.stringify(content)),
-    type
+    type,
+    timestamp: Math.floor(Date.now() / 60000) // Change every minute to allow retries
   };
   return crypto.createHash('sha256').update(JSON.stringify(normalized)).digest('hex').slice(0,12);
 }
@@ -179,15 +180,81 @@ function checkRateLimit() {
   return true;
 }
 
+// URL shortening for performance optimization
+async function shortenUrlIfLong(url, threshold = 100) {
+  if (!url || url.length <= threshold) return url;
+
+  try {
+    console.log(`URL shortening: ${url.length} chars, attempting TinyURL...`);
+    const response = await axios.post(
+      'http://tinyurl.com/api-create.php',
+      `url=${encodeURIComponent(url)}`,
+      {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        timeout: 5000
+      }
+    );
+    const shortUrl = response.data?.trim();
+    if (shortUrl && shortUrl.startsWith('http')) {
+      console.log(`URL shortened: ${url.length} -> ${shortUrl.length} chars`);
+      return shortUrl;
+    }
+  } catch (error) {
+    console.warn('URL shortening failed:', error.message);
+  }
+  return url; // Return original if shortening fails
+}
+
 /* -------- DEDUPE & SENT CACHE -------- */
 const dedupe = new LRU({ max: MAX_DEDUPE_ENTRIES, ttl: DEDUPE_TTL_MS });
 
 // Sent cache prevents duplicate API calls for same to+payload within TTL.
-// Extended TTL to cover phantom delivery window
-const SENT_CACHE_TTL_MS = parseInt(process.env.SENT_CACHE_TTL_MS || String(PHANTOM_DELIVERY_WINDOW_MS), 10);
+// Reduced TTL - allow same user to get same content multiple times per session
+const SENT_CACHE_TTL_MS = parseInt(process.env.SENT_CACHE_TTL_MS || "30000", 10); // 30 seconds only
 const sentCache = new LRU({ max: 20000, ttl: SENT_CACHE_TTL_MS });
 
 app.get("/health", (req, res) => res.json({ ok: true }));
+
+// URL testing endpoint for diagnostics
+app.post("/test-url", async (req, res) => {
+  const { to, url, shortener } = req.body;
+  if (!to || !url) return res.status(400).json({ error: "to and url required" });
+
+  const normalizedTo = normalizePhone(to) || to;
+
+  try {
+    let testUrl = url;
+
+    // Optional URL shortening for testing
+    if (shortener === 'tinyurl') {
+      const tinyResponse = await axios.post('http://tinyurl.com/api-create.php', `url=${encodeURIComponent(url)}`, {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        timeout: 10000
+      });
+      testUrl = tinyResponse.data;
+      console.log(`URL shortened: ${url.length} chars -> ${testUrl.length} chars`);
+    }
+
+    const startTime = Date.now();
+    const response = await sendTextOnce(normalizedTo, testUrl, 15000); // 15s timeout for testing
+    const timing = Date.now() - startTime;
+
+    return res.json({
+      success: true,
+      originalUrl: url,
+      sentUrl: testUrl,
+      timing: `${timing}ms`,
+      response: response?.status || 'unknown'
+    });
+  } catch (error) {
+    console.error('URL test failed:', error.message);
+    return res.status(500).json({
+      error: error.message,
+      originalUrl: url,
+      timing: error.code === 'ECONNABORTED' ? 'TIMEOUT' : 'ERROR'
+    });
+  }
+});
 
 /* -------- JOB QUEUE (in-memory) -------- */
 const jobs = new Map();
@@ -410,7 +477,10 @@ async function sendDocumentRobust(toPhone, mediaId, filename) {
 
 /* sendTextRobustOrQueue: quick immediate tries, then queue with longer timeout */
 async function sendTextRobustOrQueue(toPhone, body) {
-  const fingerprint = createMessageFingerprint(toPhone, body, 'text');
+  // Optimize long URLs for better WHAPI performance
+  const optimizedBody = await shortenUrlIfLong(body, 120);
+
+  const fingerprint = createMessageFingerprint(toPhone, optimizedBody, 'text');
   if (sentCache.get(fingerprint)) {
     console.log(`sendTextRobustOrQueue: already sent (fingerprint: ${fingerprint}) - skipping`);
     return null;
@@ -418,8 +488,8 @@ async function sendTextRobustOrQueue(toPhone, body) {
 
   for (let i = 0; i < TEXT_IMMEDIATE_TRIES; i++) {
     try {
-      console.log(`sendTextRobustOrQueue: quick try ${i + 1} to ${toPhone}`);
-      const r = await sendTextOnce(toPhone, body, TEXT_TIMEOUT_MS);
+      console.log(`sendTextRobustOrQueue: quick try ${i + 1} to ${toPhone} (${optimizedBody.length} chars)`);
+      const r = await sendTextOnce(toPhone, optimizedBody, TEXT_TIMEOUT_MS);
       if (r && r.skipped) { console.log("sendText quick: skipped (already sent)"); return r; }
       console.log("sendText quick success", r.status);
       return r;
@@ -437,7 +507,7 @@ async function sendTextRobustOrQueue(toPhone, body) {
     id: jobId,
     type: "text",
     to: toPhone,
-    body,
+    body: optimizedBody, // Use optimized/shortened URL
     fingerprint,
     attempts: 0,
     maxAttempts: JOB_MAX_RETRIES,
