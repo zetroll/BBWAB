@@ -44,18 +44,25 @@ const AC_MEDIA_ID = process.env.AC_MEDIA_ID || "";
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || null;
 const SENDER_PHONE = process.env.SENDER_PHONE || null;
 
-const TEXT_TIMEOUT_MS = parseInt(process.env.TEXT_TIMEOUT_MS || "5000", 10); // slightly higher to reduce false timeouts
-const TEXT_IMMEDIATE_TRIES = parseInt(process.env.TEXT_IMMEDIATE_TRIES || "2", 10);
+const TEXT_TIMEOUT_MS = parseInt(process.env.TEXT_TIMEOUT_MS || "8000", 10); // 8s for initial attempts
+const TEXT_IMMEDIATE_TRIES = parseInt(process.env.TEXT_IMMEDIATE_TRIES || "1", 10); // single quick try
 const DOC_TIMEOUT_MS = parseInt(process.env.DOC_TIMEOUT_MS || "30000", 10);
 const DOC_RETRIES = parseInt(process.env.DOC_RETRIES || "1", 10);
+const JOB_TEXT_TIMEOUT_MS = parseInt(process.env.JOB_TEXT_TIMEOUT_MS || "30000", 10); // longer timeout for job retries
 
-const JOB_MAX_RETRIES = parseInt(process.env.JOB_MAX_RETRIES || "5", 10);
+const JOB_MAX_RETRIES = parseInt(process.env.JOB_MAX_RETRIES || "2", 10); // reduced from 5
 const JOB_RETRY_BASE_MS = parseInt(process.env.JOB_RETRY_BASE_MS || "2000", 10);
 const ADMIN_KEY = process.env.ADMIN_KEY || null;
 
 const DEDUPE_TTL_MIN = parseInt(process.env.DEDUPE_TTL_MIN || "5", 10);
 const DEDUPE_TTL_MS = DEDUPE_TTL_MIN * 60 * 1000;
 const MAX_DEDUPE_ENTRIES = parseInt(process.env.MAX_DEDUPE_ENTRIES || "10000", 10);
+
+const PHANTOM_DELIVERY_WINDOW_MS = parseInt(process.env.PHANTOM_DELIVERY_WINDOW_MS || "120000", 10); // 2 minutes
+
+// Rate limiting for 5 TPS max
+const RATE_LIMIT_TPS = parseInt(process.env.RATE_LIMIT_TPS || "5", 10);
+const rateLimitWindow = new LRU({ max: 1000, ttl: 1000 }); // 1 second windows
 
 if (!SEND_API_KEY) {
   console.error("Missing SEND_API_KEY - aborting.");
@@ -105,17 +112,76 @@ function normalizePhone(raw) {
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
-/* small hashing helper for sentCache key */
+/* Enhanced request tracing and fingerprinting */
 function sha256hex(input) {
   return crypto.createHash("sha256").update(input).digest("hex");
+}
+
+function createRequestTrace(type, to, payload) {
+  return {
+    id: crypto.randomUUID(),
+    type,
+    to: normalizePhone(to) || to,
+    payloadHash: crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex').slice(0,8),
+    startTime: Date.now(),
+    attempts: 0
+  };
+}
+
+function createMessageFingerprint(to, content, type) {
+  const normalized = {
+    to: normalizePhone(to),
+    content: type === 'text' ? content : (content.media || content.body || JSON.stringify(content)),
+    type
+  };
+  return crypto.createHash('sha256').update(JSON.stringify(normalized)).digest('hex').slice(0,12);
+}
+
+function analyzeWhapiResponse(trace, response, error) {
+  const timing = Date.now() - trace.startTime;
+  const analysis = {
+    timing: `${timing}ms`,
+    status: response?.status || 'ERROR',
+    hasPreview: response?.data?.preview ? 'YES' : 'NO',
+    hasLinkPreview: response?.data?.link_preview ? 'YES' : 'NO',
+    hasThumbnail: response?.data?.thumbnail ? 'YES' : 'NO',
+    responseSize: JSON.stringify(response?.data || {}).length,
+    errorType: error?.code || error?.message?.slice(0,50) || 'none',
+    responseData: JSON.stringify(response?.data || {}).slice(0, 400) // increased for preview analysis
+  };
+  console.log(`TRACE ${trace.id}: ${trace.type} ${analysis.timing}`, analysis);
+
+  // Additional preview diagnostics
+  if (response?.data) {
+    const data = response.data;
+    if (data.message_id) console.log(`TRACE ${trace.id}: Message ID: ${data.message_id}`);
+    if (data.preview_url) console.log(`TRACE ${trace.id}: Preview URL: ${data.preview_url}`);
+    if (data.media_url) console.log(`TRACE ${trace.id}: Media URL: ${data.media_url}`);
+  }
+
+  return analysis;
+}
+
+function checkRateLimit() {
+  const now = Date.now();
+  const currentSecond = Math.floor(now / 1000);
+  const currentCount = rateLimitWindow.get(currentSecond) || 0;
+
+  if (currentCount >= RATE_LIMIT_TPS) {
+    console.warn(`Rate limit exceeded: ${currentCount}/${RATE_LIMIT_TPS} TPS`);
+    return false;
+  }
+
+  rateLimitWindow.set(currentSecond, currentCount + 1);
+  return true;
 }
 
 /* -------- DEDUPE & SENT CACHE -------- */
 const dedupe = new LRU({ max: MAX_DEDUPE_ENTRIES, ttl: DEDUPE_TTL_MS });
 
-// Sent cache prevents duplicate API calls for same to+payload within short TTL.
-// TTL: 10 minutes by default (tunable)
-const SENT_CACHE_TTL_MS = parseInt(process.env.SENT_CACHE_TTL_MS || String(10 * 60 * 1000), 10);
+// Sent cache prevents duplicate API calls for same to+payload within TTL.
+// Extended TTL to cover phantom delivery window
+const SENT_CACHE_TTL_MS = parseInt(process.env.SENT_CACHE_TTL_MS || String(PHANTOM_DELIVERY_WINDOW_MS), 10);
 const sentCache = new LRU({ max: 20000, ttl: SENT_CACHE_TTL_MS });
 
 app.get("/health", (req, res) => res.json({ ok: true }));
@@ -144,24 +210,22 @@ setInterval(async () => {
     jobs.set(job.id, job);
     console.log("Processing job", job.id, job.type, "attempt", job.attempts + 1, "/", job.maxAttempts);
     try {
-      // Idempotency check: if an equivalent message was already sent, skip and remove job
-      const key = job.type === "doc" ? `doc:${job.to}:${job.media}` : `text:${job.to}:${job.body}`;
-      if (sentCache.get(key)) {
-        console.log(`Job ${job.id} skipped - already sent (sentCache)`);
+      // Enhanced idempotency check using fingerprints
+      const fingerprint = job.fingerprint || (job.type === "doc" ? createMessageFingerprint(job.to, { media: job.media }, 'document') : createMessageFingerprint(job.to, job.body, 'text'));
+      if (sentCache.get(fingerprint)) {
+        console.log(`Job ${job.id} skipped - already sent (fingerprint: ${fingerprint})`);
         jobs.delete(job.id);
         continue;
       }
 
       if (job.type === "doc") {
         await sendDocumentRobust(job.to, job.media, job.filename);
-        console.log("Job success doc", job.id);
-        // mark sent (prevents duplicate sends)
-        sentCache.set(key, true);
+        console.log(`Job success doc ${job.id} (fingerprint: ${fingerprint})`);
         jobs.delete(job.id);
       } else if (job.type === "text") {
-        await sendTextOnce(job.to, job.body, TEXT_TIMEOUT_MS);
-        console.log("Job success text", job.id);
-        sentCache.set(key, true);
+        // Use longer timeout for job retries
+        await sendTextOnce(job.to, job.body, JOB_TEXT_TIMEOUT_MS);
+        console.log(`Job success text ${job.id} (fingerprint: ${fingerprint})`);
         jobs.delete(job.id);
       } else {
         console.warn("Unknown job type", job.type, job.id);
@@ -188,48 +252,99 @@ setInterval(async () => {
 /* -------- WHAPI helpers -------- */
 
 async function sendTextOnce(toPhone, body, timeoutMs) {
-  // idempotency: check sentCache before sending and mark after success
-  const key = `text:${toPhone}:${body}`;
-  if (sentCache.get(key)) {
-    console.log("sendTextOnce: skipped (already sent according to cache)", toPhone);
-    return { skipped: true };
+  const trace = createRequestTrace('text', toPhone, { body });
+  const fingerprint = createMessageFingerprint(toPhone, body, 'text');
+
+  if (sentCache.get(fingerprint)) {
+    console.log(`TRACE ${trace.id}: sendTextOnce SKIPPED (fingerprint: ${fingerprint})`, toPhone);
+    return { skipped: true, fingerprint };
   }
-  const headers = { Authorization: `Bearer ${SEND_API_KEY}`, "Content-Type": "application/json" };
+
+  const headers = {
+    Authorization: `Bearer ${SEND_API_KEY}`,
+    "Content-Type": "application/json",
+    "X-Request-Id": trace.id
+  };
   const payload = { to: String(toPhone), body: String(body) };
-  const resp = await axios.post(SEND_TEXT_URL, payload, { headers, timeout: timeoutMs });
-  // success -> mark sent
-  sentCache.set(key, true);
-  return resp;
+
+  if (!checkRateLimit()) {
+    throw new Error('Rate limit exceeded - please retry later');
+  }
+
+  try {
+    const resp = await axios.post(SEND_TEXT_URL, payload, { headers, timeout: timeoutMs });
+    analyzeWhapiResponse(trace, resp);
+    sentCache.set(fingerprint, true);
+    console.log(`TRACE ${trace.id}: sendTextOnce SUCCESS (fingerprint: ${fingerprint})`);
+    return resp;
+  } catch (error) {
+    analyzeWhapiResponse(trace, null, error);
+    throw error;
+  }
 }
 
 async function sendDocumentJsonOnce(toPhone, mediaId, filename, timeoutMs) {
-  const key = `doc:${toPhone}:${mediaId}`;
-  if (sentCache.get(key)) {
-    console.log("sendDocumentJsonOnce: skipped (already sent)", toPhone, mediaId);
-    return { skipped: true };
+  const trace = createRequestTrace('doc-json', toPhone, { media: mediaId, filename });
+  const fingerprint = createMessageFingerprint(toPhone, { media: mediaId }, 'document');
+
+  if (sentCache.get(fingerprint)) {
+    console.log(`TRACE ${trace.id}: sendDocumentJsonOnce SKIPPED (fingerprint: ${fingerprint})`, toPhone, mediaId);
+    return { skipped: true, fingerprint };
   }
-  const headers = { Authorization: `Bearer ${SEND_API_KEY}`, "Content-Type": "application/json" };
+
+  const headers = {
+    Authorization: `Bearer ${SEND_API_KEY}`,
+    "Content-Type": "application/json",
+    "X-Request-Id": trace.id
+  };
   const payload = { to: String(toPhone), media: String(mediaId), filename: filename ? String(filename) : undefined, type: "document" };
-  const resp = await axios.post(SEND_DOC_URL, payload, { headers, timeout: timeoutMs });
-  sentCache.set(key, true);
-  return resp;
+
+  if (!checkRateLimit()) {
+    throw new Error('Rate limit exceeded - please retry later');
+  }
+
+  try {
+    const resp = await axios.post(SEND_DOC_URL, payload, { headers, timeout: timeoutMs });
+    analyzeWhapiResponse(trace, resp);
+    sentCache.set(fingerprint, true);
+    console.log(`TRACE ${trace.id}: sendDocumentJsonOnce SUCCESS (fingerprint: ${fingerprint})`);
+    return resp;
+  } catch (error) {
+    analyzeWhapiResponse(trace, null, error);
+    throw error;
+  }
 }
 
 async function sendDocumentMultipartOnce(toPhone, mediaId, filename, timeoutMs) {
-  const key = `doc:${toPhone}:${mediaId}`;
-  if (sentCache.get(key)) {
-    console.log("sendDocumentMultipartOnce: skipped (already sent)", toPhone, mediaId);
-    return { skipped: true };
+  const trace = createRequestTrace('doc-multipart', toPhone, { media: mediaId, filename });
+  const fingerprint = createMessageFingerprint(toPhone, { media: mediaId }, 'document');
+
+  if (sentCache.get(fingerprint)) {
+    console.log(`TRACE ${trace.id}: sendDocumentMultipartOnce SKIPPED (fingerprint: ${fingerprint})`, toPhone, mediaId);
+    return { skipped: true, fingerprint };
   }
+
   const form = new FormData();
   form.append("to", String(toPhone));
   form.append("media", String(mediaId));
   if (filename) form.append("filename", String(filename));
   form.append("type", "document");
-  const headers = { Authorization: `Bearer ${SEND_API_KEY}`, ...form.getHeaders() };
-  const resp = await axios.post(SEND_DOC_URL, form, { headers, timeout: timeoutMs, maxContentLength: Infinity, maxBodyLength: Infinity });
-  sentCache.set(key, true);
-  return resp;
+  const headers = {
+    Authorization: `Bearer ${SEND_API_KEY}`,
+    "X-Request-Id": trace.id,
+    ...form.getHeaders()
+  };
+
+  try {
+    const resp = await axios.post(SEND_DOC_URL, form, { headers, timeout: timeoutMs, maxContentLength: Infinity, maxBodyLength: Infinity });
+    analyzeWhapiResponse(trace, resp);
+    sentCache.set(fingerprint, true);
+    console.log(`TRACE ${trace.id}: sendDocumentMultipartOnce SUCCESS (fingerprint: ${fingerprint})`);
+    return resp;
+  } catch (error) {
+    analyzeWhapiResponse(trace, null, error);
+    throw error;
+  }
 }
 
 /* Robust document sender */
@@ -270,11 +385,11 @@ async function sendDocumentRobust(toPhone, mediaId, filename) {
   throw lastErr || new Error("Document send exhausted attempts");
 }
 
-/* sendTextRobustOrQueue: quick immediate tries, then queue */
+/* sendTextRobustOrQueue: quick immediate tries, then queue with longer timeout */
 async function sendTextRobustOrQueue(toPhone, body) {
-  const key = `text:${toPhone}:${body}`;
-  if (sentCache.get(key)) {
-    console.log("sendTextRobustOrQueue: already sent (cache) - skipping");
+  const fingerprint = createMessageFingerprint(toPhone, body, 'text');
+  if (sentCache.get(fingerprint)) {
+    console.log(`sendTextRobustOrQueue: already sent (fingerprint: ${fingerprint}) - skipping`);
     return null;
   }
 
@@ -293,28 +408,45 @@ async function sendTextRobustOrQueue(toPhone, body) {
     }
   }
 
-  // enqueue job for retries
+  // enqueue job for retries with longer timeout
   const jobId = makeJobId();
   const job = {
     id: jobId,
     type: "text",
     to: toPhone,
     body,
+    fingerprint,
     attempts: 0,
     maxAttempts: JOB_MAX_RETRIES,
     nextAttemptAt: Date.now() + JOB_RETRY_BASE_MS,
     locked: false
   };
   addJob(job);
-  console.log("text send queued as job", jobId);
+  console.log(`text send queued as job ${jobId} (fingerprint: ${fingerprint})`);
   return null;
 }
 
-/* interactive send */
+/* interactive send with merged intro */
 async function sendInteractiveButtons(toPhone) {
-  const headers = { Authorization: `Bearer ${SEND_API_KEY}`, "Content-Type": "application/json" };
+  const trace = createRequestTrace('interactive', toPhone, { buttons: 'intro+choices' });
+  const fingerprint = createMessageFingerprint(toPhone, { type: 'interactive', body: INTRO_TEXT + INTERACTIVE_BODY }, 'interactive');
+
+  if (sentCache.get(fingerprint)) {
+    console.log(`TRACE ${trace.id}: sendInteractiveButtons SKIPPED (fingerprint: ${fingerprint})`, toPhone);
+    return { skipped: true, fingerprint };
+  }
+
+  const headers = {
+    Authorization: `Bearer ${SEND_API_KEY}`,
+    "Content-Type": "application/json",
+    "X-Request-Id": trace.id
+  };
+
+  // Merge intro text with interactive body for single API call
+  const combinedText = `${INTRO_TEXT}\n\n${INTERACTIVE_BODY}`;
+
   const payload = {
-    body: { text: INTERACTIVE_BODY },
+    body: { text: combinedText },
     action: {
       buttons: [
         { type: "quick_reply", title: TV_BUTTON_TITLE, id: TV_BUTTON_ID },
@@ -324,7 +456,21 @@ async function sendInteractiveButtons(toPhone) {
     type: "button",
     to: String(toPhone)
   };
-  return axios.post(SEND_INTERACTIVE_URL, payload, { headers, timeout: TEXT_TIMEOUT_MS });
+
+  if (!checkRateLimit()) {
+    throw new Error('Rate limit exceeded - please retry later');
+  }
+
+  try {
+    const resp = await axios.post(SEND_INTERACTIVE_URL, payload, { headers, timeout: TEXT_TIMEOUT_MS });
+    analyzeWhapiResponse(trace, resp);
+    sentCache.set(fingerprint, true);
+    console.log(`TRACE ${trace.id}: sendInteractiveButtons SUCCESS (fingerprint: ${fingerprint})`);
+    return resp;
+  } catch (error) {
+    analyzeWhapiResponse(trace, null, error);
+    throw error;
+  }
 }
 
 /* extract helpers */
@@ -468,9 +614,10 @@ app.post("/webhook", async (req, res) => {
             console.log("background: TV doc sent");
           } catch (err) {
             logAxiosError("background TV doc failed", err);
-            // queue doc job
+            // queue doc job with fingerprint
             const id = makeJobId();
-            addJob({ id, type: "doc", to: from, media: TV_MEDIA_ID, filename, attempts: 0, maxAttempts: JOB_MAX_RETRIES, nextAttemptAt: Date.now() + JOB_RETRY_BASE_MS, locked: false });
+            const fingerprint = createMessageFingerprint(from, { media: TV_MEDIA_ID }, 'document');
+            addJob({ id, type: "doc", to: from, media: TV_MEDIA_ID, filename, fingerprint, attempts: 0, maxAttempts: JOB_MAX_RETRIES, nextAttemptAt: Date.now() + JOB_RETRY_BASE_MS, locked: false });
           }
         })();
 
@@ -492,7 +639,8 @@ app.post("/webhook", async (req, res) => {
           } catch (err) {
             logAxiosError("background AC doc failed", err);
             const id = makeJobId();
-            addJob({ id, type: "doc", to: from, media: AC_MEDIA_ID, filename, attempts: 0, maxAttempts: JOB_MAX_RETRIES, nextAttemptAt: Date.now() + JOB_RETRY_BASE_MS, locked: false });
+            const fingerprint = createMessageFingerprint(from, { media: AC_MEDIA_ID }, 'document');
+            addJob({ id, type: "doc", to: from, media: AC_MEDIA_ID, filename, fingerprint, attempts: 0, maxAttempts: JOB_MAX_RETRIES, nextAttemptAt: Date.now() + JOB_RETRY_BASE_MS, locked: false });
           }
         })();
 
@@ -513,7 +661,7 @@ app.post("/webhook", async (req, res) => {
     if (typed === TV_BUTTON_TITLE.toLowerCase() || typed === "tv") {
       const filename = "Dilip's Favourite TVs.pdf";
       (async () => {
-        try { await sendDocumentRobust(from, TV_MEDIA_ID, filename); } catch (err) { logAxiosError("typed TV doc failed", err); const id = makeJobId(); addJob({ id, type: "doc", to: from, media: TV_MEDIA_ID, filename, attempts: 0, maxAttempts: JOB_MAX_RETRIES, nextAttemptAt: Date.now() + JOB_RETRY_BASE_MS, locked: false }); }
+        try { await sendDocumentRobust(from, TV_MEDIA_ID, filename); } catch (err) { logAxiosError("typed TV doc failed", err); const id = makeJobId(); const fingerprint = createMessageFingerprint(from, { media: TV_MEDIA_ID }, 'document'); addJob({ id, type: "doc", to: from, media: TV_MEDIA_ID, filename, fingerprint, attempts: 0, maxAttempts: JOB_MAX_RETRIES, nextAttemptAt: Date.now() + JOB_RETRY_BASE_MS, locked: false }); }
       })();
       (async () => { try { await sendTextRobustOrQueue(from, TV_LINK); } catch (err) { logAxiosError("typed TV text fatal", err); } })();
       return res.status(200).send("accepted-tv-typed");
@@ -521,21 +669,20 @@ app.post("/webhook", async (req, res) => {
     if (typed === AC_BUTTON_TITLE.toLowerCase() || typed === "ac") {
       const filename = "Dilip's Favourite ACs.pdf";
       (async () => {
-        try { await sendDocumentRobust(from, AC_MEDIA_ID, filename); } catch (err) { logAxiosError("typed AC doc failed", err); const id = makeJobId(); addJob({ id, type: "doc", to: from, media: AC_MEDIA_ID, filename, attempts: 0, maxAttempts: JOB_MAX_RETRIES, nextAttemptAt: Date.now() + JOB_RETRY_BASE_MS, locked: false }); }
+        try { await sendDocumentRobust(from, AC_MEDIA_ID, filename); } catch (err) { logAxiosError("typed AC doc failed", err); const id = makeJobId(); const fingerprint = createMessageFingerprint(from, { media: AC_MEDIA_ID }, 'document'); addJob({ id, type: "doc", to: from, media: AC_MEDIA_ID, filename, fingerprint, attempts: 0, maxAttempts: JOB_MAX_RETRIES, nextAttemptAt: Date.now() + JOB_RETRY_BASE_MS, locked: false }); }
       })();
       (async () => { try { await sendTextRobustOrQueue(from, AC_LINK); } catch (err) { logAxiosError("typed AC text fatal", err); } })();
       return res.status(200).send("accepted-ac-typed");
     }
 
-    // otherwise initial inbound -> intro + interactive (best-effort)
-    (async () => { try { await sendTextOnce(from, INTRO_TEXT, TEXT_TIMEOUT_MS); } catch (errIntro) { logAxiosError("intro text failed", errIntro); } })();
+    // otherwise initial inbound -> send combined intro + interactive buttons (single API call)
     try {
       await sendInteractiveButtons(from);
-      console.log("interactive sent");
-      return res.status(200).send("interactive-sent");
+      console.log("combined intro+interactive sent");
+      return res.status(200).send("intro-interactive-sent");
     } catch (errInteractive) {
-      logAxiosError("interactive failed", errInteractive);
-      return res.status(502).send("interactive-send-failed");
+      logAxiosError("combined intro+interactive failed", errInteractive);
+      return res.status(502).send("intro-interactive-send-failed");
     }
   } catch (err) {
     console.error("Unhandled webhook error:", err);
