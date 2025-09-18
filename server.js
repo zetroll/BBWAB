@@ -616,7 +616,7 @@ function normalizeButtonId(rawId) {
 function getCategoryMessage(categoryId) {
   const messages = {
     'tv': 'Bada screen aur bhi bada drama! 📺 Yeh raha saare ke saare TV deals – just for you.',
-    'ac': 'Kaafi cool choice! ❄️ Yeh rahe best deals on AC – all at ₹100/day!',
+    'ac': 'Kaafi cool choice! ❄️ Yeh rahe best deals on AC – all at ₹100/day*!',
     'refrigerator': 'Serving cool vibes only! 🧊 Saari ki saari cool deals are here!',
     'washing_machine': 'Ab hogi sirf kaapdo ki dhulayi! 🌀 Here are your deals on Washing Machine!',
     'kitchen_home': 'Ghar ke har kone ke liye ek deal 🏠 only and only for you!'
