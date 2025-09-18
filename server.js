@@ -598,7 +598,15 @@ app.post("/webhook", async (req, res) => {
       return res.status(200).send("ignored-from-me");
     }
 
-    // Check for phantom delivery of our own outbound messages
+    const messageId = incoming.messageId || Date.now().toString();
+    let rawFrom = incoming.from;
+    let from = normalizePhone(rawFrom);
+    if (!from) {
+      console.warn("invalid from:", JSON.stringify(incoming.raw).slice(0, 300));
+      return res.status(400).send("missing-sender");
+    }
+
+    // Check for phantom delivery of our own outbound messages (after 'from' is defined)
     if (incoming.text) {
       const messageKey = `out:${from}:${crypto.createHash('sha256').update(incoming.text).digest('hex').slice(0,12)}`;
       const outboundRecord = outboundMessageCache.get(messageKey);
@@ -617,14 +625,6 @@ app.post("/webhook", async (req, res) => {
         console.log(`PHANTOM DELIVERY DETECTED (doc): ${messageKey} (original trace: ${outboundRecord.traceId})`);
         return res.status(200).send("ignored-phantom-delivery");
       }
-    }
-
-    const messageId = incoming.messageId || Date.now().toString();
-    let rawFrom = incoming.from;
-    let from = normalizePhone(rawFrom);
-    if (!from) {
-      console.warn("invalid from:", JSON.stringify(incoming.raw).slice(0, 300));
-      return res.status(400).send("missing-sender");
     }
 
     if (SENDER_PHONE) {
