@@ -44,9 +44,6 @@ const REFRIGERATOR_MEDIA_ID = process.env.REFRIGERATOR_MEDIA_ID || "";
 const WASHING_MACHINE_BUTTON_TITLE = process.env.WASHING_MACHINE_BUTTON_TITLE || "Washing Machine";
 const WASHING_MACHINE_BUTTON_ID = process.env.WASHING_MACHINE_BUTTON_ID || "washing_machine";
 const WASHING_MACHINE_MEDIA_ID = process.env.WASHING_MACHINE_MEDIA_ID || "";
-const KITCHEN_HOME_BUTTON_TITLE = process.env.KITCHEN_HOME_BUTTON_TITLE || "Kitchen & Home Deals";
-const KITCHEN_HOME_BUTTON_ID = process.env.KITCHEN_HOME_BUTTON_ID || "kitchen_home";
-const KITCHEN_HOME_MEDIA_ID = process.env.KITCHEN_HOME_MEDIA_ID || "";
 
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || null;
 const SENDER_PHONE = process.env.SENDER_PHONE || null;
@@ -78,7 +75,7 @@ if (!SEND_API_KEY) {
   console.error("Missing SEND_API_KEY - aborting.");
   process.exit(1);
 }
-if (!TV_MEDIA_ID || !AC_MEDIA_ID || !REFRIGERATOR_MEDIA_ID || !WASHING_MACHINE_MEDIA_ID || !KITCHEN_HOME_MEDIA_ID) {
+if (!TV_MEDIA_ID || !AC_MEDIA_ID || !REFRIGERATOR_MEDIA_ID || !WASHING_MACHINE_MEDIA_ID) {
   console.error("Missing one or more media IDs for categories - aborting.");
   process.exit(1);
 }
@@ -552,8 +549,7 @@ async function sendInteractiveButtons(toPhone) {
         { type: "quick_reply", title: TV_BUTTON_TITLE, id: TV_BUTTON_ID },
         { type: "quick_reply", title: AC_BUTTON_TITLE, id: AC_BUTTON_ID },
         { type: "quick_reply", title: REFRIGERATOR_BUTTON_TITLE, id: REFRIGERATOR_BUTTON_ID },
-        { type: "quick_reply", title: WASHING_MACHINE_BUTTON_TITLE, id: WASHING_MACHINE_BUTTON_ID },
-        { type: "quick_reply", title: KITCHEN_HOME_BUTTON_TITLE, id: KITCHEN_HOME_BUTTON_ID }
+        { type: "quick_reply", title: WASHING_MACHINE_BUTTON_TITLE, id: WASHING_MACHINE_BUTTON_ID }
       ]
     },
     type: "button",
@@ -618,8 +614,7 @@ function getCategoryMessage(categoryId) {
     'tv': 'Bada screen aur bhi bada drama! 📺 Yeh raha saare ke saare TV deals – just for you.',
     'ac': 'Kaafi cool choice! ❄️ Yeh rahe best deals on AC – all at ₹100/day*!',
     'refrigerator': 'Serving cool vibes only! 🧊 Saari ki saari cool deals are here!',
-    'washing_machine': 'Ab hogi sirf kaapdo ki dhulayi! 🌀 Here are your deals on Washing Machine!',
-    'kitchen_home': 'Ghar ke har kone ke liye ek deal 🏠 only and only for you!'
+    'washing_machine': 'Ab hogi sirf kaapdo ki dhulayi! 🌀 Here are your deals on Washing Machine!'
   };
   return messages[categoryId] || 'Here are your deals!';
 }
@@ -629,8 +624,7 @@ function getCategoryData(categoryId) {
     'tv': { mediaId: TV_MEDIA_ID, filename: "Dilip's Favourite TVs.pdf" },
     'ac': { mediaId: AC_MEDIA_ID, filename: "Dilip's Favourite ACs.pdf" },
     'refrigerator': { mediaId: REFRIGERATOR_MEDIA_ID, filename: "Dilip's Favourite Refrigerators.pdf" },
-    'washing_machine': { mediaId: WASHING_MACHINE_MEDIA_ID, filename: "Dilip's Favourite Washing Machines.pdf" },
-    'kitchen_home': { mediaId: KITCHEN_HOME_MEDIA_ID, filename: "Dilip's Kitchen & Home Deals.pdf" }
+    'washing_machine': { mediaId: WASHING_MACHINE_MEDIA_ID, filename: "Dilip's Favourite Washing Machines.pdf" }
   };
   return categoryMap[categoryId];
 }
@@ -797,8 +791,7 @@ app.post("/webhook", async (req, res) => {
       'tv': [TV_BUTTON_TITLE.toLowerCase(), 'tv', 'television'],
       'ac': [AC_BUTTON_TITLE.toLowerCase(), 'ac', 'air conditioner'],
       'refrigerator': [REFRIGERATOR_BUTTON_TITLE.toLowerCase(), 'refrigerator', 'fridge', 'ref'],
-      'washing_machine': [WASHING_MACHINE_BUTTON_TITLE.toLowerCase(), 'washing machine', 'washer', 'washing'],
-      'kitchen_home': [KITCHEN_HOME_BUTTON_TITLE.toLowerCase(), 'kitchen', 'home', 'kitchen home']
+      'washing_machine': [WASHING_MACHINE_BUTTON_TITLE.toLowerCase(), 'washing machine', 'washer', 'washing']
     };
 
     for (const [categoryId, keywords] of Object.entries(typedMatches)) {
