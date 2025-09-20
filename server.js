@@ -53,12 +53,35 @@ const MAX_DEDUPE_ENTRIES = parseInt(process.env.MAX_DEDUPE_ENTRIES || "10000", 1
 
 const PHANTOM_DELIVERY_WINDOW_MS = parseInt(process.env.PHANTOM_DELIVERY_WINDOW_MS || "120000", 10); // 2 minutes
 
-// Rate limiting for 5 TPS max
-const RATE_LIMIT_TPS = parseInt(process.env.RATE_LIMIT_TPS || "5", 10);
-const rateLimitWindow = new LRU({ max: 1000, ttl: 1000 }); // 1 second windows
+// Anti-ban rate limiting (WHAPI guidelines: max 2 messages per minute)
+const RATE_LIMIT_PER_MINUTE = parseInt(process.env.RATE_LIMIT_PER_MINUTE || "2", 10);
+const rateLimitWindow = new LRU({ max: 1000, ttl: 60000 }); // 1 minute windows
 
-// Outbound message tracking to prevent phantom delivery duplicates
+// User interaction tracking for anti-ban measures
+const userInteractionCache = new LRU({ max: 10000, ttl: 7 * 24 * 60 * 60 * 1000 }); // 7 days
 const outboundMessageCache = new LRU({ max: 10000, ttl: PHANTOM_DELIVERY_WINDOW_MS });
+
+// Queue for delayed message sending (anti-ban timing)
+const messageQueue = [];
+const processingQueue = new Set();
+
+// Greeting variations for natural behavior
+const greetingBank = [
+  "", // No greeting (30% chance)
+  "Hi",
+  "Hello",
+  "Namaste",
+  "Hello friend",
+  "Hi dost",
+  "Namaste friend",
+  "Hii",
+  "Hi!",
+  "Hi dost!",
+  "Hello!"
+];
+
+// Emoji responses for follow-ups
+const emojiResponses = ["✅", "😊", "👍", "🙏", "😄", "👌"];
 
 if (!SEND_API_KEY) {
   console.error("Missing SEND_API_KEY - aborting.");
@@ -161,41 +184,160 @@ function analyzeWhapiResponse(trace, response, error) {
 
 function checkRateLimit() {
   const now = Date.now();
-  const currentSecond = Math.floor(now / 1000);
-  const currentCount = rateLimitWindow.get(currentSecond) || 0;
+  const currentMinute = Math.floor(now / 60000);
+  const currentCount = rateLimitWindow.get(currentMinute) || 0;
 
-  if (currentCount >= RATE_LIMIT_TPS) {
-    console.warn(`Rate limit exceeded: ${currentCount}/${RATE_LIMIT_TPS} TPS`);
+  if (currentCount >= RATE_LIMIT_PER_MINUTE) {
+    console.warn(`Rate limit exceeded: ${currentCount}/${RATE_LIMIT_PER_MINUTE} per minute`);
     return false;
   }
 
-  rateLimitWindow.set(currentSecond, currentCount + 1);
+  rateLimitWindow.set(currentMinute, currentCount + 1);
   return true;
 }
 
-// URL shortening for performance optimization
-async function shortenUrlIfLong(url, threshold = 100) {
-  if (!url || url.length <= threshold) return url;
+function getRandomDelay() {
+  // Minimum 2 seconds, maximum 10 seconds, with millisecond variation
+  return Math.max(2000, Math.floor(Math.random() * 10000) + Math.random() * 1000);
+}
 
-  try {
-    console.log(`URL shortening: ${url.length} chars, attempting TinyURL...`);
-    const response = await axios.post(
-      'http://tinyurl.com/api-create.php',
-      `url=${encodeURIComponent(url)}`,
-      {
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        timeout: 5000
-      }
-    );
-    const shortUrl = response.data?.trim();
-    if (shortUrl && shortUrl.startsWith('http')) {
-      console.log(`URL shortened: ${url.length} -> ${shortUrl.length} chars`);
-      return shortUrl;
+function getRandomGreeting() {
+  // 30% chance of no greeting, 70% chance of random greeting
+  if (Math.random() < 0.3) return "";
+  const greetings = greetingBank.slice(1); // Exclude empty string
+  return greetings[Math.floor(Math.random() * greetings.length)];
+}
+
+function shouldSendDirectPDF() {
+  // 5% chance to send PDF directly with greeting
+  return Math.random() < 0.05;
+}
+
+function hasUserBeenContacted(phoneNumber) {
+  const userKey = normalizePhone(phoneNumber);
+  return userInteractionCache.has(userKey);
+}
+
+function markUserContacted(phoneNumber, interactionType = 'initial') {
+  const userKey = normalizePhone(phoneNumber);
+  const userData = userInteractionCache.get(userKey) || {
+    firstContact: Date.now(),
+    interactions: [],
+    sentInitial: false,
+    sentFollowUp: false
+  };
+
+  userData.interactions.push({ type: interactionType, timestamp: Date.now() });
+  if (interactionType === 'initial') userData.sentInitial = true;
+  if (interactionType === 'followup') userData.sentFollowUp = true;
+
+  userInteractionCache.set(userKey, userData);
+  return userData;
+}
+
+function getRandomEmoji() {
+  return emojiResponses[Math.floor(Math.random() * emojiResponses.length)];
+}
+
+async function queueMessage(phoneNumber, messageType, data) {
+  const delay = getRandomDelay();
+  const executeAt = Date.now() + delay;
+
+  const queueItem = {
+    id: crypto.randomUUID(),
+    phoneNumber,
+    messageType,
+    data,
+    executeAt,
+    attempts: 0
+  };
+
+  messageQueue.push(queueItem);
+  console.log(`Queued ${messageType} for ${phoneNumber} in ${delay}ms`);
+
+  // Sort queue by execution time
+  messageQueue.sort((a, b) => a.executeAt - b.executeAt);
+}
+
+async function processMessageQueue() {
+  const now = Date.now();
+  const readyMessages = messageQueue.filter(msg => msg.executeAt <= now && !processingQueue.has(msg.id));
+
+  for (const msg of readyMessages) {
+    if (!checkRateLimit()) {
+      console.log('Rate limit hit, delaying queue processing');
+      break;
     }
-  } catch (error) {
-    console.warn('URL shortening failed:', error.message);
+
+    processingQueue.add(msg.id);
+    const index = messageQueue.findIndex(m => m.id === msg.id);
+    if (index > -1) messageQueue.splice(index, 1);
+
+    try {
+      await executeQueuedMessage(msg);
+    } catch (error) {
+      console.error(`Failed to execute queued message ${msg.id}:`, error.message);
+    } finally {
+      processingQueue.delete(msg.id);
+    }
   }
-  return url; // Return original if shortening fails
+}
+
+async function executeQueuedMessage(msg) {
+  const { phoneNumber, messageType, data } = msg;
+
+  switch (messageType) {
+    case 'greeting_and_pdf':
+      await sendGreetingAndPDF(phoneNumber, data.greeting, data.directPDF);
+      break;
+    case 'emoji_response':
+      await sendTextOnce(phoneNumber, data.emoji, TEXT_TIMEOUT_MS);
+      console.log(`Sent emoji response to ${phoneNumber}`);
+      break;
+    default:
+      console.warn(`Unknown message type: ${messageType}`);
+  }
+}
+
+async function sendGreetingAndPDF(phoneNumber, greeting, directPDF) {
+  try {
+    if (directPDF) {
+      // Send PDF with greeting as caption (5% of cases)
+      const payload = {
+        to: String(phoneNumber),
+        media: String(COMBINED_MEDIA_ID),
+        filename: COMBINED_FILENAME,
+        caption: greeting || INTRO_TEXT,
+        type: "document"
+      };
+
+      const headers = {
+        Authorization: `Bearer ${SEND_API_KEY}`,
+        "Content-Type": "application/json",
+        "X-Request-Id": crypto.randomUUID()
+      };
+
+      await axios.post(SEND_DOC_URL, payload, { headers, timeout: DOC_TIMEOUT_MS });
+      console.log(`Sent direct PDF with greeting to ${phoneNumber}`);
+    } else {
+      // Send greeting first, then PDF
+      if (greeting) {
+        const fullMessage = `${greeting} ${INTRO_TEXT}`.trim();
+        await sendTextOnce(phoneNumber, fullMessage, TEXT_TIMEOUT_MS);
+
+        // Small delay before PDF
+        await new Promise(resolve => setTimeout(resolve, 1000 + Math.random() * 2000));
+      }
+
+      await sendDocumentRobust(phoneNumber, COMBINED_MEDIA_ID, COMBINED_FILENAME);
+      console.log(`Sent greeting + PDF to ${phoneNumber}`);
+    }
+
+    markUserContacted(phoneNumber, 'initial');
+  } catch (error) {
+    console.error(`Failed to send greeting and PDF to ${phoneNumber}:`, error.message);
+    throw error;
+  }
 }
 
 /* -------- DEDUPE & SENT CACHE -------- */
@@ -207,6 +349,9 @@ const SENT_CACHE_TTL_MS = parseInt(process.env.SENT_CACHE_TTL_MS || "30000", 10)
 const sentCache = new LRU({ max: 20000, ttl: SENT_CACHE_TTL_MS });
 
 app.get("/health", (req, res) => res.json({ ok: true }));
+
+// Start queue processor
+setInterval(processMessageQueue, 1000); // Check every second
 
 // URL testing endpoint for diagnostics
 app.post("/test-url", async (req, res) => {
@@ -468,49 +613,6 @@ async function sendDocumentRobust(toPhone, mediaId, filename) {
   throw lastErr || new Error("Document send exhausted attempts");
 }
 
-/* sendTextRobustOrQueue: quick immediate tries, then queue with longer timeout */
-async function sendTextRobustOrQueue(toPhone, body) {
-  // Optimize long URLs for better WHAPI performance
-  const optimizedBody = await shortenUrlIfLong(body, 120);
-
-  const fingerprint = createMessageFingerprint(toPhone, optimizedBody, 'text');
-  if (sentCache.get(fingerprint)) {
-    console.log(`sendTextRobustOrQueue: already sent (fingerprint: ${fingerprint}) - skipping`);
-    return null;
-  }
-
-  for (let i = 0; i < TEXT_IMMEDIATE_TRIES; i++) {
-    try {
-      console.log(`sendTextRobustOrQueue: quick try ${i + 1} to ${toPhone} (${optimizedBody.length} chars)`);
-      const r = await sendTextOnce(toPhone, optimizedBody, TEXT_TIMEOUT_MS);
-      if (r && r.skipped) { console.log("sendText quick: skipped (already sent)"); return r; }
-      console.log("sendText quick success", r.status);
-      return r;
-    } catch (err) {
-      logAxiosError(`sendText quick try ${i + 1}`, err);
-      const s = err?.response?.status;
-      if (s && [401, 403].includes(s)) throw err;
-      // otherwise continue to next quick try
-    }
-  }
-
-  // enqueue job for retries with longer timeout
-  const jobId = makeJobId();
-  const job = {
-    id: jobId,
-    type: "text",
-    to: toPhone,
-    body: optimizedBody, // Use optimized/shortened URL
-    fingerprint,
-    attempts: 0,
-    maxAttempts: JOB_MAX_RETRIES,
-    nextAttemptAt: Date.now() + JOB_RETRY_BASE_MS,
-    locked: false
-  };
-  addJob(job);
-  console.log(`text send queued as job ${jobId} (fingerprint: ${fingerprint})`);
-  return null;
-}
 
 
 /* extract helpers */
@@ -646,34 +748,35 @@ app.post("/webhook", async (req, res) => {
     }
     dedupe.set(messageId, true);
 
-    // Simple passive flow: intro message + PDF
-    console.log("Processing inbound message - sending intro + PDF");
+    // Check if user has already been contacted
+    if (hasUserBeenContacted(from)) {
+      const userData = userInteractionCache.get(normalizePhone(from));
 
-    // Send intro message first
-    (async () => {
-      try {
-        await sendTextOnce(from, INTRO_TEXT, TEXT_TIMEOUT_MS);
-        console.log("intro message sent");
-      } catch (err) {
-        logAxiosError("intro message failed", err);
+      // If user responds after initial contact, send emoji once
+      if (userData.sentInitial && !userData.sentFollowUp) {
+        console.log(`User ${from} responded - queueing emoji response`);
+        await queueMessage(from, 'emoji_response', { emoji: getRandomEmoji() });
+        markUserContacted(from, 'followup');
+        return res.status(200).send("emoji-queued");
+      } else {
+        console.log(`User ${from} already contacted - ignoring`);
+        return res.status(200).send("already-contacted");
       }
-    })();
+    }
 
-    // Send combined PDF
-    (async () => {
-      try {
-        await sendDocumentRobust(from, COMBINED_MEDIA_ID, COMBINED_FILENAME);
-        console.log("combined PDF sent (flow complete)");
-      } catch (err) {
-        logAxiosError("combined PDF failed", err);
-        // queue doc job with fingerprint
-        const id = makeJobId();
-        const fingerprint = createMessageFingerprint(from, { media: COMBINED_MEDIA_ID }, 'document');
-        addJob({ id, type: "doc", to: from, media: COMBINED_MEDIA_ID, filename: COMBINED_FILENAME, fingerprint, attempts: 0, maxAttempts: JOB_MAX_RETRIES, nextAttemptAt: Date.now() + JOB_RETRY_BASE_MS, locked: false });
-      }
-    })();
+    // New user - queue initial contact with anti-ban measures
+    console.log(`New user ${from} - queueing initial contact`);
 
-    return res.status(200).send("intro-pdf-sent");
+    const greeting = getRandomGreeting();
+    const directPDF = shouldSendDirectPDF();
+
+    await queueMessage(from, 'greeting_and_pdf', {
+      greeting,
+      directPDF
+    });
+
+    console.log(`Queued ${directPDF ? 'direct PDF' : 'greeting + PDF'} for ${from}`);
+    return res.status(200).send("contact-queued");
   } catch (err) {
     console.error("Unhandled webhook error:", err);
     return res.status(500).send("internal-error");
