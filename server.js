@@ -193,7 +193,7 @@ const SURVEY_QUESTIONS = [
     section: 'DECISION-MAKING',
     text: 'Q12. Are you part of any business association/chamber?',
     options: [
-      { id: 'a', text: 'Yes, and I'm active', points: 2 },
+      { id: 'a', text: 'Yes, and I\'m active', points: 2 },
       { id: 'b', text: 'Yes, but not very active', points: 1 },
       { id: 'c', text: 'No', points: 0 }
     ]
