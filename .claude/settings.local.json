@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:whapi.cloud)",
+      "WebFetch(domain:whapi.readme.io)",
+      "WebSearch",
+      "WebFetch(domain:support.whapi.cloud)",
+      "Bash(git checkout:*)",
+      "Bash(git add:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
